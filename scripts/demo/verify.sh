@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Demo Object Verifier (RPO Measurement)
-# Compares all objects in data-bucket between Region A and Region B.
-# Reports total objects, synchronized count, and missing objects (RPO).
+# Demo Object Verifier (Eventual Consistency Audit)
+# Compares all objects in data-bucket between Region A and Region B after failback.
+# Reports total objects, synchronized count, and out-of-sync delta.
 # ==============================================================================
 
 set -eu
@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=================================================================="
-echo "== HA Data Platform - Cross-Region Consistency & RPO Audit     =="
+echo "== HA Data Platform - Cross-Region Eventual Consistency Audit  =="
 echo "   Bucket : ${BUCKET}"
 echo "=================================================================="
 
@@ -54,21 +54,21 @@ total_rpo_delta=$((missing_b_count + missing_a_count))
 
 echo ""
 echo "=================================================================="
-echo "== Verification Results & RPO Metrics                           =="
+echo "== Eventual Consistency Audit Results                           =="
 echo "=================================================================="
-echo "   Region A Total Objects : ${count_a}"
-echo "   Region B Total Objects : ${count_b}"
-echo "   Synchronized Objects   : ${sync_count}"
-echo "   Present in A, absent B : ${missing_b_count}"
-echo "   Present in B, absent A : ${missing_a_count}"
-echo "   Total Unsynced (RPO)   : ${total_rpo_delta} objects"
+echo "   Region A Total Objects   : ${count_a}"
+echo "   Region B Total Objects   : ${count_b}"
+echo "   Synchronized Objects     : ${sync_count}"
+echo "   Present in A, absent B   : ${missing_b_count}"
+echo "   Present in B, absent A   : ${missing_a_count}"
+echo "   Out-of-Sync Discrepancy  : ${total_rpo_delta} objects"
 echo "=================================================================="
 
 if [ "${total_rpo_delta}" -eq 0 ]; then
-  echo "[PASS] 100% Consistency Achieved. RPO = 0 (Zero Data Loss)."
+  echo "[PASS] 100% Eventual Consistency Achieved (Zero Cross-Region Divergence)."
   exit 0
 else
-  echo "[WARN] Data discrepancy detected between regions (RPO = ${total_rpo_delta} objects)."
+  echo "[WARN] Data discrepancy detected between regions (${total_rpo_delta} out-of-sync objects)."
   if [ "${missing_b_count}" -gt 0 ]; then
     echo "--- Missing in Region B (top 10): ---"
     head -n 10 "${TMP_DIR}/missing_in_b.txt"
