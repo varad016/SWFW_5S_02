@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Failover Controller Daemon
-Continuously monitors Primary Region (minio-a). Upon N consecutive health-check failures,
-repoints the Global Nginx Proxy to Secondary Region (minio-b), triggers reload,
-and records precise RTO measurements.
+Monitors Primary Region (minio-a) via HTTP GET /minio/health/live (expecting 200 OK).
+Uses cached endpoint IP resolution to eliminate glibc DNS getaddrinfo timeouts when the container dies.
+Upon N consecutive probe failures, repoints the Global Nginx Proxy to Secondary Region (minio-b),
+triggers Nginx reload via the Docker socket, and logs RTO measurements.
 """
 
 import os
@@ -28,6 +29,8 @@ METRICS_FILE = os.getenv("METRICS_FILE", "/var/log/metrics/failover_rto.log")
 FAILURE_TIMESTAMP_FILE = os.getenv("FAILURE_TIMESTAMP_FILE", "/var/log/metrics/failure.timestamp")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 PROXY_CONTAINER_NAME = os.getenv("PROXY_CONTAINER_NAME", "global-proxy")
+
+CACHED_PRIMARY_IP = None
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -54,23 +57,45 @@ def reload_nginx(container_name):
         return False
 
 
-def check_health(url, timeout=1.0):
-    """Checks endpoint HTTP status with fast connection timeout."""
+def get_target_ip(hostname):
+    """Returns cached IP address to completely avoid blocking DNS calls when container is dead."""
+    global CACHED_PRIMARY_IP
+    if CACHED_PRIMARY_IP:
+        return CACHED_PRIMARY_IP
+    try:
+        ip = socket.gethostbyname(hostname)
+        CACHED_PRIMARY_IP = ip
+        return ip
+    except Exception:
+        return hostname
+
+
+def refresh_primary_ip():
+    """Refreshes primary IP in the background when healthy."""
+    global CACHED_PRIMARY_IP
+    try:
+        CACHED_PRIMARY_IP = socket.gethostbyname(PRIMARY_HOST)
+    except Exception:
+        pass
+
+
+def check_health_http(url, timeout=1.0, is_primary=True):
+    """Performs HTTP GET request expecting 200 OK status code."""
     try:
         parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname
+        hostname = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        path = parsed.path or "/"
+        path = parsed.path or "/minio/health/live"
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
+        target_host = get_target_ip(hostname) if is_primary else hostname
 
-        req = f"HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: HA-Failover-Controller\r\nConnection: close\r\n\r\n"
-        sock.sendall(req.encode())
-        data = sock.recv(128)
-        sock.close()
-        return b"200 OK" in data
+        conn = http.client.HTTPConnection(target_host, port, timeout=timeout)
+        conn.request("GET", path, headers={"Host": f"{hostname}:{port}", "User-Agent": "HA-Failover-Controller/1.0"})
+        resp = conn.getresponse()
+        status = resp.status
+        resp.read()
+        conn.close()
+        return status == 200
     except Exception:
         return False
 
@@ -79,16 +104,25 @@ def write_nginx_config(backend_host, backend_port):
     """Generates new Nginx configuration from template and writes to disk."""
     if not os.path.exists(TEMPLATE_PATH):
         content = (
-            f"upstream minio_backend {{\n    server {backend_host}:{backend_port};\n}}\n"
-            "server {\n    listen 8000;\n    server_name _;\n"
-            "    client_max_body_size 0;\n    proxy_buffering off;\n    proxy_request_buffering off;\n"
-            "    location / {\n        proxy_pass http://minio_backend;\n"
+            "server {\n"
+            "    listen 8000;\n"
+            "    server_name _;\n"
+            "    resolver 127.0.0.11 valid=2s ipv6=off;\n"
+            f"    set $backend_upstream http://{backend_host}:{backend_port};\n"
+            "    client_max_body_size 0;\n"
+            "    proxy_buffering off;\n"
+            "    proxy_request_buffering off;\n"
+            "    location / {\n"
+            "        proxy_pass $backend_upstream;\n"
             "        proxy_set_header Host $http_host;\n"
             "        proxy_set_header X-Real-IP $remote_addr;\n"
             "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
             "        proxy_set_header X-Forwarded-Proto $scheme;\n"
-            "        proxy_connect_timeout 1s;\n        proxy_read_timeout 30s;\n        proxy_send_timeout 30s;\n"
-            "    }\n}\n"
+            "        proxy_connect_timeout 1s;\n"
+            "        proxy_read_timeout 30s;\n"
+            "        proxy_send_timeout 30s;\n"
+            "    }\n"
+            "}\n"
         )
     else:
         with open(TEMPLATE_PATH, "r") as f:
@@ -102,7 +136,7 @@ def write_nginx_config(backend_host, backend_port):
 
 
 def read_failure_timestamp(default_t):
-    """Reads failure timestamp written by chaos scripts if present."""
+    """Reads crash failure timestamp recorded by chaos scripts."""
     if os.path.exists(FAILURE_TIMESTAMP_FILE):
         try:
             with open(FAILURE_TIMESTAMP_FILE, "r") as f:
@@ -124,42 +158,54 @@ def log_rto_metric(record):
 
     print("\n" + "=" * 60, flush=True)
     print(f"[FAILOVER EVENT] {record['event']} -> {record['to']}", flush=True)
-    print(f"  Failure Timestamp (T0)   : {record['t_failure']:.4f}", flush=True)
-    print(f"  Detection Timestamp (T1) : {record['t_detect']:.4f}", flush=True)
-    print(f"  First Success (T2)       : {record['t_first_success']:.4f}", flush=True)
-    print(f"  Detection Latency        : {record['detection_latency_seconds']:.3f} s", flush=True)
-    print(f"  Switchover Duration      : {record['switchover_seconds']:.3f} s", flush=True)
-    print(f"  Total RTO (T2 - T0)      : {record['rto_seconds']:.3f} s", flush=True)
+    print(f"  Failure Timestamp (T_failure)        : {record['t_failure']:.4f}", flush=True)
+    print(f"  First Failed Probe (T_first_fail)    : {record['t_first_fail']:.4f}", flush=True)
+    print(f"  Detection Timestamp (T_detect)       : {record['t_detect']:.4f}", flush=True)
+    print(f"  First Success Through Proxy (T_succ) : {record['t_first_success']:.4f}", flush=True)
+    print(f"  Detection Latency (T_detect - T_fail): {record['detection_latency_from_failure_seconds']:.3f} s", flush=True)
+    print(f"  Detection From First Fail            : {record['detection_latency_from_first_fail_seconds']:.3f} s", flush=True)
+    print(f"  Switchover Time (T_succ - T_detect)  : {record['switchover_duration_seconds']:.3f} s", flush=True)
+    print(f"  Total RTO (T_succ - T_fail)          : {record['total_rto_seconds']:.3f} s", flush=True)
     print("=" * 60 + "\n", flush=True)
 
 
 def main():
     print("=" * 60, flush=True)
-    print("== HA Failover Controller Initializing                  ==", flush=True)
-    print(f"   Primary Endpoint : {PRIMARY_ENDPOINT}", flush=True)
+    print("== HA Failover Controller Initializing (HTTP Probe)     ==", flush=True)
+    print(f"   Primary Endpoint : {PRIMARY_ENDPOINT} (expecting HTTP 200)", flush=True)
     print(f"   Secondary Host   : {SECONDARY_HOST}:{BACKEND_PORT}", flush=True)
-    print(f"   Threshold        : {FAILOVER_THRESHOLD} consecutive failures", flush=True)
+    print(f"   Threshold (N)    : {FAILOVER_THRESHOLD} consecutive failures", flush=True)
     print(f"   Probe Interval   : {CHECK_INTERVAL} s", flush=True)
     print("=" * 60, flush=True)
 
+    # Initial resolution once on startup
+    init_ip = get_target_ip(PRIMARY_HOST)
+    print(f"   Discovered Initial Primary IP: {init_ip}", flush=True)
+
     active_backend = PRIMARY_HOST
     consecutive_failures = 0
+    t_first_fail = None
 
     while True:
-        is_healthy = check_health(PRIMARY_ENDPOINT, timeout=1.0)
+        is_healthy = check_health_http(PRIMARY_ENDPOINT, timeout=1.0, is_primary=True)
 
         if is_healthy:
             if consecutive_failures > 0:
-                print(f"[HEARTBEAT] Primary {PRIMARY_HOST} recovered. Resetting failure counter.", flush=True)
+                print(f"[HEARTBEAT] Primary {PRIMARY_HOST} healthy. Resetting failure counter.", flush=True)
                 consecutive_failures = 0
-            # If active_backend was SECONDARY_HOST, we keep it on secondary until explicit failback is requested
+                t_first_fail = None
+            refresh_primary_ip()
         else:
+            if consecutive_failures == 0:
+                t_first_fail = time.time()
+                print(f"[WARNING] First probe failure detected on {PRIMARY_HOST} at {t_first_fail:.4f}", flush=True)
+
             consecutive_failures += 1
-            print(f"[WARNING] Primary {PRIMARY_HOST} healthcheck failed ({consecutive_failures}/{FAILOVER_THRESHOLD})", flush=True)
+            print(f"[WARNING] Primary {PRIMARY_HOST} probe failed ({consecutive_failures}/{FAILOVER_THRESHOLD})", flush=True)
 
             if consecutive_failures >= FAILOVER_THRESHOLD and active_backend == PRIMARY_HOST:
                 t_detect = time.time()
-                t_failure = read_failure_timestamp(t_detect)
+                t_failure = read_failure_timestamp(t_first_fail or t_detect)
 
                 print(f"\n[ALERT] Failure threshold reached ({consecutive_failures} failures). Initiating failover to {SECONDARY_HOST}...", flush=True)
 
@@ -174,7 +220,7 @@ def main():
                 t_first_success = None
                 poll_start = time.time()
                 while time.time() - poll_start < 15:
-                    if check_health(GLOBAL_PROXY_URL, timeout=0.5):
+                    if check_health_http(GLOBAL_PROXY_URL, timeout=0.5, is_primary=False):
                         t_first_success = time.time()
                         break
                     time.sleep(0.05)
@@ -183,7 +229,8 @@ def main():
                     t_first_success = time.time()
                     print("[ERROR] Timeout waiting for global proxy to confirm 200 OK from secondary region.", flush=True)
 
-                detection_latency = max(0.0, t_detect - t_failure)
+                det_from_failure = max(0.0, t_detect - t_failure)
+                det_from_first_fail = max(0.0, t_detect - (t_first_fail or t_detect))
                 switchover_duration = max(0.0, t_first_success - t_detect)
                 total_rto = max(0.0, t_first_success - t_failure)
 
@@ -192,11 +239,13 @@ def main():
                     "from": PRIMARY_HOST,
                     "to": SECONDARY_HOST,
                     "t_failure": t_failure,
+                    "t_first_fail": t_first_fail,
                     "t_detect": t_detect,
                     "t_first_success": t_first_success,
-                    "detection_latency_seconds": round(detection_latency, 4),
-                    "switchover_seconds": round(switchover_duration, 4),
-                    "rto_seconds": round(total_rto, 4),
+                    "detection_latency_from_failure_seconds": round(det_from_failure, 4),
+                    "detection_latency_from_first_fail_seconds": round(det_from_first_fail, 4),
+                    "switchover_duration_seconds": round(switchover_duration, 4),
+                    "total_rto_seconds": round(total_rto, 4),
                     "iso_timestamp": datetime.now(timezone.utc).isoformat()
                 }
 
