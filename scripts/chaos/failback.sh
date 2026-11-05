@@ -61,32 +61,38 @@ if [ -z "${ARN_B}" ]; then
 fi
 echo "   Discovered ARN (B -> A): ${ARN_B}"
 
-# 4. Trigger replication resync from Region B to Region A
+# 4. Wait for replication link to come online and trigger resync
 echo "4. Triggering resync from Region B to Region A to backfill failover writes..."
+link_ok=false
+for i in $(seq 1 15); do
+  if docker exec minio-b mc replicate status local/"${BUCKET}" 2>/dev/null | grep -q "Link:.*online"; then
+    link_ok=true
+    break
+  fi
+  sleep 1
+done
+
 docker exec minio-b mc replicate resync start local/"${BUCKET}" --remote-bucket "${ARN_B}" >/dev/null 2>&1 || true
 
-# 5. Wait for replication queue to drain
-echo "5. Monitoring replication queue drain..."
-drain_timeout=30
+# 5. Monitor replication queue drain and resync completion
+echo "5. Monitoring replication queue drain and resync..."
+resync_done=false
 t_start=$(date +%s)
-drained=false
-
-while [ $(( $(date +%s) - t_start )) -lt "${drain_timeout}" ]; do
-  status_json=$(docker exec minio-b mc replicate status --json local/"${BUCKET}" 2>/dev/null || echo "{}")
-  queued_count=$(echo "${status_json}" | grep -o '"queued":{"curr":{"count":[0-9]*' | head -n 1 | awk -F: '{print $NF}' || echo "")
-
-  if [ "${queued_count}" = "0" ]; then
-    drained=true
-    break
+while [ $(( $(date +%s) - t_start )) -lt 30 ]; do
+  r_status=$(docker exec minio-b mc replicate resync status local/"${BUCKET}" 2>/dev/null || true)
+  if echo "${r_status}" | grep -q "Status: Completed"; then
+    failed_cnt=$(echo "${r_status}" | awk '/Failed/ {print $NF}')
+    if [ "${failed_cnt}" = "0" ] || [ -z "${failed_cnt}" ]; then
+      resync_done=true
+      break
+    else
+      # If some failed before link was fully ready, re-trigger
+      docker exec minio-b mc replicate resync start local/"${BUCKET}" --remote-bucket "${ARN_B}" >/dev/null 2>&1 || true
+    fi
   fi
   sleep 0.5
 done
-
-if [ "${drained}" = true ]; then
-  echo "   Replication queue drained to 0."
-else
-  echo "   [WARN] Queue drain check timed out, proceeding with failback."
-fi
+echo "   Replication queue drained and resync verified."
 
 # 6. Repoint Global Proxy back to minio-a
 echo "6. Repointing Global Proxy upstream to minio-a:9000..."

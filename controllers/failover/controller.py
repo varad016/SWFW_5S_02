@@ -2,7 +2,8 @@
 """
 Failover Controller Daemon
 Monitors Primary Region (minio-a) via HTTP GET /minio/health/live (expecting 200 OK).
-Uses cached endpoint IP resolution to eliminate glibc DNS getaddrinfo timeouts when the container dies.
+Uses static IP literal targeting to prevent glibc getaddrinfo DNS timeouts when the container dies.
+Logs per-probe start time, duration, and error type.
 Upon N consecutive probe failures, repoints the Global Nginx Proxy to Secondary Region (minio-b),
 triggers Nginx reload via the Docker socket, and logs RTO measurements.
 """
@@ -22,15 +23,17 @@ PRIMARY_HOST = os.getenv("PRIMARY_HOST", "minio-a")
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "9000"))
 GLOBAL_PROXY_URL = os.getenv("GLOBAL_PROXY_URL", "http://global-proxy:8000/minio/health/live")
 FAILOVER_THRESHOLD = int(os.getenv("FAILOVER_THRESHOLD", "3"))
-CHECK_INTERVAL = float(os.getenv("HEALTHCHECK_INTERVAL_SECONDS", "2"))
+CHECK_INTERVAL = float(os.getenv("HEALTHCHECK_INTERVAL_SECONDS", "1.0"))
+PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT_SECONDS", "0.5"))
 CONFIG_PATH = os.getenv("CONFIG_PATH", "/etc/nginx/conf.d/nginx.conf")
 TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "/etc/nginx/conf.d/nginx.conf.template")
 METRICS_FILE = os.getenv("METRICS_FILE", "/var/log/metrics/failover_rto.log")
+PROBE_LOG_FILE = os.getenv("PROBE_LOG_FILE", "/var/log/metrics/probe_trace.log")
 FAILURE_TIMESTAMP_FILE = os.getenv("FAILURE_TIMESTAMP_FILE", "/var/log/metrics/failure.timestamp")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 PROXY_CONTAINER_NAME = os.getenv("PROXY_CONTAINER_NAME", "global-proxy")
 
-CACHED_PRIMARY_IP = None
+PRIMARY_IP = None
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -57,47 +60,49 @@ def reload_nginx(container_name):
         return False
 
 
-def get_target_ip(hostname):
-    """Returns cached IP address to completely avoid blocking DNS calls when container is dead."""
-    global CACHED_PRIMARY_IP
-    if CACHED_PRIMARY_IP:
-        return CACHED_PRIMARY_IP
+def get_or_resolve_primary_ip():
+    """Resolves primary IP once and caches it permanently to avoid DNS delays on dead containers."""
+    global PRIMARY_IP
+    if PRIMARY_IP:
+        return PRIMARY_IP
+    for _ in range(30):
+        try:
+            ip = socket.gethostbyname(PRIMARY_HOST)
+            PRIMARY_IP = ip
+            return ip
+        except Exception:
+            time.sleep(0.5)
+    return PRIMARY_HOST
+
+
+def check_health_http(url, timeout=0.5, is_primary=True):
+    """
+    Performs HTTP GET request expecting 200 OK.
+    Returns (is_healthy, duration_ms, error_type).
+    """
+    t_start = time.time()
+    parsed = urllib.parse.urlparse(url)
+    hostname = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/minio/health/live"
+
+    target_host = get_or_resolve_primary_ip() if is_primary else hostname
+
     try:
-        ip = socket.gethostbyname(hostname)
-        CACHED_PRIMARY_IP = ip
-        return ip
-    except Exception:
-        return hostname
-
-
-def refresh_primary_ip():
-    """Refreshes primary IP in the background when healthy."""
-    global CACHED_PRIMARY_IP
-    try:
-        CACHED_PRIMARY_IP = socket.gethostbyname(PRIMARY_HOST)
-    except Exception:
-        pass
-
-
-def check_health_http(url, timeout=1.0, is_primary=True):
-    """Performs HTTP GET request expecting 200 OK status code."""
-    try:
-        parsed = urllib.parse.urlparse(url)
-        hostname = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        path = parsed.path or "/minio/health/live"
-
-        target_host = get_target_ip(hostname) if is_primary else hostname
-
+        # Connecting to IP literal avoids getaddrinfo DNS resolution
         conn = http.client.HTTPConnection(target_host, port, timeout=timeout)
         conn.request("GET", path, headers={"Host": f"{hostname}:{port}", "User-Agent": "HA-Failover-Controller/1.0"})
         resp = conn.getresponse()
         status = resp.status
         resp.read()
         conn.close()
-        return status == 200
-    except Exception:
-        return False
+        duration_ms = (time.time() - t_start) * 1000.0
+        if status == 200:
+            return True, duration_ms, "None"
+        return False, duration_ms, f"HTTP_{status}"
+    except Exception as e:
+        duration_ms = (time.time() - t_start) * 1000.0
+        return False, duration_ms, type(e).__name__
 
 
 def write_nginx_config(backend_host, backend_port):
@@ -148,6 +153,23 @@ def read_failure_timestamp(default_t):
     return default_t
 
 
+def log_probe(probe_index, t_probe, duration_ms, is_healthy, err_type):
+    """Logs individual probe trace to file and console."""
+    status_str = "OK" if is_healthy else "FAIL"
+    log_line = (
+        f"probe_index={probe_index} timestamp={t_probe:.4f} "
+        f"status={status_str} duration_ms={duration_ms:.2f} error={err_type}"
+    )
+    print(f"[PROBE TRACE] {log_line}", flush=True)
+
+    try:
+        os.makedirs(os.path.dirname(PROBE_LOG_FILE), exist_ok=True)
+        with open(PROBE_LOG_FILE, "a") as f:
+            f.write(log_line + "\n")
+    except Exception:
+        pass
+
+
 def log_rto_metric(record):
     """Appends measurement record to metrics file and console."""
     os.makedirs(os.path.dirname(METRICS_FILE), exist_ok=True)
@@ -171,33 +193,41 @@ def log_rto_metric(record):
 
 def main():
     print("=" * 60, flush=True)
-    print("== HA Failover Controller Initializing (HTTP Probe)     ==", flush=True)
+    print("== HA Failover Controller Initializing (Tightened HTTP) ==", flush=True)
     print(f"   Primary Endpoint : {PRIMARY_ENDPOINT} (expecting HTTP 200)", flush=True)
     print(f"   Secondary Host   : {SECONDARY_HOST}:{BACKEND_PORT}", flush=True)
     print(f"   Threshold (N)    : {FAILOVER_THRESHOLD} consecutive failures", flush=True)
     print(f"   Probe Interval   : {CHECK_INTERVAL} s", flush=True)
+    print(f"   Probe Timeout    : {PROBE_TIMEOUT} s", flush=True)
     print("=" * 60, flush=True)
 
-    # Initial resolution once on startup
-    init_ip = get_target_ip(PRIMARY_HOST)
-    print(f"   Discovered Initial Primary IP: {init_ip}", flush=True)
+    # Initial IP resolution
+    resolved_ip = get_or_resolve_primary_ip()
+    print(f"   Locked Primary IP: {resolved_ip}", flush=True)
 
     active_backend = PRIMARY_HOST
     consecutive_failures = 0
     t_first_fail = None
+    probe_counter = 0
 
     while True:
-        is_healthy = check_health_http(PRIMARY_ENDPOINT, timeout=1.0, is_primary=True)
+        probe_counter += 1
+        t_probe = time.time()
+        is_healthy, duration_ms, err_type = check_health_http(
+            PRIMARY_ENDPOINT, timeout=PROBE_TIMEOUT, is_primary=True
+        )
+
+        if not is_healthy:
+            log_probe(probe_counter, t_probe, duration_ms, is_healthy, err_type)
 
         if is_healthy:
             if consecutive_failures > 0:
                 print(f"[HEARTBEAT] Primary {PRIMARY_HOST} healthy. Resetting failure counter.", flush=True)
                 consecutive_failures = 0
                 t_first_fail = None
-            refresh_primary_ip()
         else:
             if consecutive_failures == 0:
-                t_first_fail = time.time()
+                t_first_fail = t_probe
                 print(f"[WARNING] First probe failure detected on {PRIMARY_HOST} at {t_first_fail:.4f}", flush=True)
 
             consecutive_failures += 1
@@ -220,7 +250,8 @@ def main():
                 t_first_success = None
                 poll_start = time.time()
                 while time.time() - poll_start < 15:
-                    if check_health_http(GLOBAL_PROXY_URL, timeout=0.5, is_primary=False):
+                    succ, p_dur, p_err = check_health_http(GLOBAL_PROXY_URL, timeout=0.3, is_primary=False)
+                    if succ:
                         t_first_success = time.time()
                         break
                     time.sleep(0.05)

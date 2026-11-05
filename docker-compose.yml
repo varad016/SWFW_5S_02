@@ -96,7 +96,8 @@ services:
       SECONDARY_HOST: "minio-b"
       BACKEND_PORT: "9000"
       GLOBAL_PROXY_URL: "http://global-proxy:8000/minio/health/live"
-      HEALTHCHECK_INTERVAL_SECONDS: ${HEALTHCHECK_INTERVAL_SECONDS:-2}
+      HEALTHCHECK_INTERVAL_SECONDS: ${HEALTHCHECK_INTERVAL_SECONDS:-1.0}
+      PROBE_TIMEOUT_SECONDS: ${PROBE_TIMEOUT_SECONDS:-0.5}
       FAILOVER_THRESHOLD: ${FAILOVER_THRESHOLD:-3}
       CONFIG_PATH: "/etc/nginx/conf.d/nginx.conf"
       TEMPLATE_PATH: "/etc/nginx/conf.d/nginx.conf.template"
