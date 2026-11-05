@@ -42,39 +42,49 @@ done
 echo "Region B is online and ready."
 
 echo "Configuring dedicated replication service user on both regions..."
-mc admin user add minio-a "${REPL_USER}" "${REPL_PASSWORD}" || true
-mc admin user add minio-b "${REPL_USER}" "${REPL_PASSWORD}" || true
-mc admin policy attach minio-a readwrite --user "${REPL_USER}" || true
-mc admin policy attach minio-b readwrite --user "${REPL_USER}" || true
+mc admin user add minio-a "${REPL_USER}" "${REPL_PASSWORD}" 2>/dev/null || true
+mc admin user add minio-b "${REPL_USER}" "${REPL_PASSWORD}" 2>/dev/null || true
+mc admin policy attach minio-a readwrite --user "${REPL_USER}" 2>/dev/null || true
+mc admin policy attach minio-b readwrite --user "${REPL_USER}" 2>/dev/null || true
 
 echo "Configuring buckets and enabling bucket versioning..."
-mc mb --ignore-existing minio-a/"${BUCKET_NAME}"
-mc mb --ignore-existing minio-b/"${BUCKET_NAME}"
-mc version enable minio-a/"${BUCKET_NAME}"
-mc version enable minio-b/"${BUCKET_NAME}"
+mc mb --ignore-existing minio-a/"${BUCKET_NAME}" 2>/dev/null || true
+mc mb --ignore-existing minio-b/"${BUCKET_NAME}" 2>/dev/null || true
+mc version enable minio-a/"${BUCKET_NAME}" 2>/dev/null || true
+mc version enable minio-b/"${BUCKET_NAME}" 2>/dev/null || true
 
 echo "Configuring cross-region bucket replication rules..."
-if ! mc replicate ls minio-a/"${BUCKET_NAME}" 2>/dev/null | grep -q "minio-b:9000/${BUCKET_NAME}"; then
-  echo "Applying replication rule: minio-a -> minio-b"
-  mc replicate add minio-a/"${BUCKET_NAME}" \
-    --remote-bucket "http://${REPL_USER}:${REPL_PASSWORD}@minio-b:9000/${BUCKET_NAME}" \
-    --priority 1
-else
-  echo "Replication rule minio-a -> minio-b already present."
-fi
+rules_a=$(mc replicate ls minio-a/"${BUCKET_NAME}" 2>/dev/null || true)
+case "$rules_a" in
+  *"minio-b:9000/${BUCKET_NAME}"*)
+    echo "Replication rule minio-a -> minio-b already present."
+    ;;
+  *)
+    echo "Applying replication rule: minio-a -> minio-b"
+    mc replicate add minio-a/"${BUCKET_NAME}" \
+      --remote-bucket "http://${REPL_USER}:${REPL_PASSWORD}@minio-b:9000/${BUCKET_NAME}" \
+      --priority 1
+    ;;
+esac
 
-if ! mc replicate ls minio-b/"${BUCKET_NAME}" 2>/dev/null | grep -q "minio-a:9000/${BUCKET_NAME}"; then
-  echo "Applying replication rule: minio-b -> minio-a"
-  mc replicate add minio-b/"${BUCKET_NAME}" \
-    --remote-bucket "http://${REPL_USER}:${REPL_PASSWORD}@minio-a:9000/${BUCKET_NAME}" \
-    --priority 1
-else
-  echo "Replication rule minio-b -> minio-a already present."
-fi
+rules_b=$(mc replicate ls minio-b/"${BUCKET_NAME}" 2>/dev/null || true)
+case "$rules_b" in
+  *"minio-a:9000/${BUCKET_NAME}"*)
+    echo "Replication rule minio-b -> minio-a already present."
+    ;;
+  *)
+    echo "Applying replication rule: minio-b -> minio-a"
+    mc replicate add minio-b/"${BUCKET_NAME}" \
+      --remote-bucket "http://${REPL_USER}:${REPL_PASSWORD}@minio-a:9000/${BUCKET_NAME}" \
+      --priority 1
+    ;;
+esac
 
 echo "============================================================"
 echo "== Replication Setup Complete. Checking Status:           =="
 echo "============================================================"
+echo "-- Region A Replication Status --"
 mc replicate status minio-a/"${BUCKET_NAME}" || true
+echo "-- Region B Replication Status --"
 mc replicate status minio-b/"${BUCKET_NAME}" || true
 echo "Provisioning succeeded."
