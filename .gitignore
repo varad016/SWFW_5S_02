@@ -1,0 +1,34 @@
+# Environment configurations & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cert
+secrets/
+
+# Data volumes & persistence
+volumes/
+data/
+*.db
+*.sqlite
+
+# Chaos test gating flag
+.chaos-active
+
+# Logs and runtime metrics
+*.log
+logs/
+
+# Docker Compose overrides
+docker-compose.override.yml
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+tmp/
