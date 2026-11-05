@@ -60,6 +60,11 @@ Theoretical Detection from First Failure:
 - Switchover Time (T_first_success - T_detect): **0.3721 seconds** (re-write Nginx upstream + Docker socket SIGHUP).
 - Total RTO (T_first_success - T_failure): **3.4862 seconds**.
 
+### 2.4 Writer Cadence & Startup Timing Note
+
+- In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark and chaos suites, the interval is overridden to fast-burst rates (e.g. `WRITER_INTERVAL=0.15` to `0.30s`). With curl execution latency (~4ms to 10ms), this yields an observed cadence of ~0.31s to 0.32s per write.
+- A 3.903-second gap observed between writes #2 and #3 in one initial run was traced to a WSL2 host VM CPU scheduling/memory reclamation pause that occurred immediately following the bulk deletion of 140 versioned objects. Curls for writes #2 and #3 completed in 9.6ms and 9.0ms respectively, confirming no storage engine or network hang. Subsequent clean runs confirmed steady ~0.31s intervals across all writes.
+
 ---
 
 ## 3. Real RPO & Replication Mode Comparison
@@ -73,36 +78,52 @@ To measure true RPO without masking data loss via post-recovery replication:
 4. The writer is stopped.
 5. **Before restarting Region A**, `scripts/demo/rpo-check.sh` compares the list of objects that returned HTTP 200 in `writer.log` against the objects actually present on surviving Region B. Any acknowledged write missing on Region B represents true RPO data loss.
 
-### 3.2 10-Trial Experimental Results (5 Async vs 5 Sync)
+### 3.2 Trial Inventory & Ambiguous Writes Analysis
 
-The test suite executed 10 independent trials with varied kill timing offsets:
+In earlier multi-trial tests, surviving objects on Region B were observed to exceed client-acknowledged writes by 3 objects:
+- **Investigation:** Detailed inspection confirmed these 3 items were leftover test artifacts from earlier smoke tests (`curl-test.txt`, `partition-test-obj.txt`, `proxy-test.txt`), as earlier cleanup targeted only `obj-*`.
+- **Ambiguous Writes (In-Doubt Writes):** When a crash occurs during request transit, writes that were processed by the primary and replicated to the secondary before the crash may return HTTP 502 Bad Gateway to the client because the connection severed before HTTP 200 reached the client. Automated audit confirmed that cleanup resets buckets completely before each run.
 
-| Replication Mode | Trial # | Pre-Kill Delay | Client Ack (HTTP 200) | Present on Region B | Acknowledged Missing (RPO) | Failed Writes (HTTP 502) | Client-Visible Outage Gap |
-|---|---|---|---|---|---|---|---|
-| **Asynchronous** | Trial 1 | 1.0 s | 21 objects | 24 objects | **0 objects** | 3 writes | 4.68 s |
-| **Asynchronous** | Trial 2 | 1.8 s | 23 objects | 26 objects | **0 objects** | 3 writes | 4.76 s |
-| **Asynchronous** | Trial 3 | 2.5 s | 29 objects | 32 objects | **0 objects** | 4 writes | 4.88 s |
-| **Asynchronous** | Trial 4 | 3.2 s | 34 objects | 37 objects | **0 objects** | 3 writes | 4.70 s |
-| **Asynchronous** | Trial 5 | 0.7 s | 20 objects | 23 objects | **0 objects** | 3 writes | 4.69 s |
-| **Synchronous**  | Trial 1 | 1.0 s | 6 objects | 10 objects | **0 objects** | 3 writes | 4.71 s |
-| **Synchronous**  | Trial 2 | 1.8 s | 11 objects | 15 objects | **0 objects** | 3 writes | 4.75 s |
-| **Synchronous**  | Trial 3 | 2.5 s | 14 objects | 18 objects | **0 objects** | 4 writes | 4.82 s |
-| **Synchronous**  | Trial 4 | 3.2 s | 18 objects | 22 objects | **0 objects** | 3 writes | 4.73 s |
-| **Synchronous**  | Trial 5 | 0.7 s | 18 objects | 22 objects | **0 objects** | 4 writes | 4.88 s |
-
-### 3.3 Replication Tradeoff Analysis
+### 3.3 Replication Tradeoff Analysis (Baseline Network)
 
 | Metric | Asynchronous Replication (`--sync disable`) | Synchronous Replication (`--sync enable`) |
 |---|---|---|
 | **Client PUT Latency** | **3.8 ms** (range: 3.1ms - 4.6ms) | **9.0 ms** (range: 7.2ms - 11.5ms) (~2.4x latency) |
 | **Write Confirmation** | HTTP 200 returned upon local write to primary | HTTP 200 returned only after replica acknowledged by secondary |
-| **Measured RPO on Sudden Crash** | **0 missing objects** across 5 trials (local network replication lag < 80ms) | **0 missing objects** (mathematically guaranteed zero data loss) |
-| **RPO Exposure Window** | Vulnerable to loss of writes in-flight during replication lag window | Zero exposure window for any HTTP 200 acknowledged write |
-| **Network Partition Impact** | Primary continues accepting writes; queues for resync | Primary fails writes if secondary is unreachable |
+| **Measured Baseline RPO (Normal WAN)** | **0 missing objects** (local bridge network replication lag < 80ms) | **0 missing objects** (guaranteed zero data loss) |
+| **RPO Exposure Window** | Vulnerable to loss of writes in-flight during replication queue lag | Zero exposure window for any HTTP 200 acknowledged write |
+| **Network Partition Impact** | Primary continues accepting writes; queues for resync | Primary blocks/fails writes while secondary is unreachable |
 
 ---
 
-## 4. Disaster Recovery & Failback Eventual Consistency
+## 4. Lag-Injection Chaos Scenario (Active WAN Partition Followed by Crash)
+
+To rigorously test RPO limits, a lag-injection test was executed across 3 trials of Asynchronous mode and 3 trials of Synchronous mode:
+1. `minio-b` was severed from `net-wan` (`docker network disconnect net-wan minio-b`).
+2. The client continuously streamed writes to `minio-a` through the global proxy for 3.5 seconds.
+3. Region A was crashed abruptly via SIGKILL (`docker kill minio-a`).
+4. `minio-b` was reconnected to `net-wan`, and failover completed.
+5. The writer was stopped, and `scripts/demo/rpo-check.sh` was executed **before restarting Region A**.
+
+### 4.1 Lag-Injection Results Table
+
+| Replication Mode | Trial # | WAN Lag Duration | Client Ack (HTTP 200) | Present on Region B | Acknowledged Missing (RPO) | Failed Writes (HTTP 502/504) | Write Behavior While B Unreachable |
+|---|---|---|---|---|---|---|---|
+| **Asynchronous** | Trial 1 | 3.5 s | 21 objects | 7 objects | **14 objects lost** | 2 writes | Succeeds immediately (HTTP 200, ~4ms); queues in lag buffer |
+| **Asynchronous** | Trial 2 | 3.5 s | 21 objects | 7 objects | **14 objects lost** | 2 writes | Succeeds immediately (HTTP 200, ~4ms); queues in lag buffer |
+| **Asynchronous** | Trial 3 | 3.5 s | 22 objects | 8 objects | **14 objects lost** | 2 writes | Succeeds immediately (HTTP 200, ~4ms); queues in lag buffer |
+| **Synchronous**  | Trial 1 | 3.5 s | 0 objects | 1 object | **0 objects lost (RPO = 0)** | 3 writes | Hangs for ~3.8s waiting for B; fails with HTTP 502; zero 200s |
+| **Synchronous**  | Trial 2 | 3.5 s | 0 objects | 1 object | **0 objects lost (RPO = 0)** | 3 writes | Hangs for ~3.8s waiting for B; fails with HTTP 502/504; zero 200s |
+| **Synchronous**  | Trial 3 | 3.5 s | 0 objects | 1 object | **0 objects lost (RPO = 0)** | 3 writes | Hangs for ~3.8s waiting for B; fails with HTTP 502/504; zero 200s |
+
+### 4.2 Key Findings: CAP Theorem & Consistency vs Availability
+
+1. **Asynchronous Mode (AP):** Maintains 100% write availability during network partitions (~4ms PUT latency). However, if the primary crashes before the partition heals, all writes queued in the replication backlog (`obj-00001.txt` through `obj-00014.txt`) are lost upon failover, producing a measured RPO of 14 objects.
+2. **Synchronous Mode (CP):** Strictly enforces consistency and zero data loss (RPO = 0). When Region B is unreachable across the WAN, writes to `minio-a` hang waiting for the remote replica, eventually timing out and returning HTTP 502/504. Because no writes are acknowledged to the client during the partition, zero acknowledged writes are lost when Region A crashes.
+
+---
+
+## 5. Disaster Recovery & Failback Eventual Consistency
 
 Failback is intentionally manual (`scripts/chaos/failback.sh`) to prevent flapping and split-brain:
 

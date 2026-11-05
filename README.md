@@ -89,7 +89,7 @@ docker exec minio-a mc replicate status local/data-bucket
 
 - **Continuous Live Writer Stream:**
   ```bash
-  # Streams numbered objects to http://localhost:8000/data-bucket/ every second
+  # Streams numbered objects to http://localhost:8000/data-bucket/ (default: 1.0s interval; override via WRITER_INTERVAL)
   ./scripts/demo/writer.sh
   ```
   Logs timestamps, object keys, HTTP codes, and latencies to `volumes/metrics/writer.log`.
