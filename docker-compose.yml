@@ -1,0 +1,75 @@
+services:
+  minio-a:
+    image: cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+    container_name: minio-a
+    hostname: minio-a
+    command: server /data --console-address ":9001"
+    profiles:
+      - region-a
+      - all
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./volumes/region-a/minio-data:/data
+    networks:
+      - net-region-a
+      - net-wan
+    ports:
+      - "${REGION_A_PORT:-9001}:9000"
+      - "${REGION_A_CONSOLE_PORT:-9002}:9001"
+    restart: unless-stopped
+
+  minio-b:
+    image: cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+    container_name: minio-b
+    hostname: minio-b
+    command: server /data --console-address ":9001"
+    profiles:
+      - region-b
+      - all
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./volumes/region-b/minio-data:/data
+    networks:
+      - net-region-b
+      - net-wan
+    ports:
+      - "${REGION_B_PORT:-9011}:9000"
+      - "${REGION_B_CONSOLE_PORT:-9012}:9001"
+    restart: unless-stopped
+
+  minio-provision:
+    image: cgr.dev/chainguard/minio@sha256:3c60a2a8c4d33409a9bc7a623a7fcbfb4605adc3d89422d2f53b3f673a6e5597
+    container_name: minio-provision
+    profiles:
+      - provision
+      - all
+    entrypoint: ["/bin/sh", "/scripts/provision.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      REPL_USER: ${REPL_USER}
+      REPL_PASSWORD: ${REPL_PASSWORD}
+      BUCKET_NAME: ${BUCKET_NAME:-data-bucket}
+    volumes:
+      - ./scripts/setup/provision.sh:/scripts/provision.sh:ro
+    networks:
+      - net-wan
+    depends_on:
+      - minio-a
+      - minio-b
+    restart: "no"
+
+networks:
+  net-region-a:
+    name: net-region-a
+    driver: bridge
+  net-region-b:
+    name: net-region-b
+    driver: bridge
+  net-wan:
+    name: net-wan
+    driver: bridge
