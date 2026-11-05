@@ -30,7 +30,7 @@ net-region-a (172.28.10.0/24)             net-region-b (172.28.20.0/24)
 
 ### Components
 1. **Region A & B MinIO Storage:** Single-node S3-compatible instances with versioned buckets.
-2. **Replication Strategy:** Bidirectional active-active bucket replication using dedicated service accounts (`mc replicate add`) over `net-wan`.
+2. **Replication Strategy:** Bidirectional active-active bucket replication using dedicated service accounts (`mc replicate add`) over `net-wan`. By default, replication operates in **asynchronous mode** for low write latency (~3.8ms), with synchronous mode (`--sync enable`) available as a zero-RPO configuration option.
 3. **Global Proxy & Failover:** Edge reverse proxy routing traffic to the active region with automatic failover tracking Recovery Time Objective (RTO).
 4. **GitOps Reconciler:** Background reconciler running on the host watching `origin/main` for drift management.
 
@@ -94,9 +94,15 @@ docker exec minio-a mc replicate status local/data-bucket
   ```
   Logs timestamps, object keys, HTTP codes, and latencies to `volumes/metrics/writer.log`.
 
-- **Cross-Region Consistency & RPO Audit:**
+- **Pre-Restart RPO Check:**
   ```bash
-  # Audits object inventories across both regions and reports missing delta (RPO)
+  # Audits client-acknowledged HTTP 200 writes against surviving Region B before restart
+  ./scripts/demo/rpo-check.sh
+  ```
+
+- **Cross-Region Eventual Consistency Audit:**
+  ```bash
+  # Audits object inventories across both regions after failback and reports divergence delta
   ./scripts/demo/verify.sh
   ```
 
