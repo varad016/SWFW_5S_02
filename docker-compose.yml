@@ -65,6 +65,55 @@ services:
       - minio-b
     restart: "no"
 
+  global-proxy:
+    image: nginx@sha256:208b70eefac13ee9be00e486f79c695b15cef861c680527171a27d253d834be9
+    container_name: global-proxy
+    hostname: global-proxy
+    profiles:
+      - global
+      - all
+    volumes:
+      - ./config/global:/etc/nginx/conf.d
+    networks:
+      - net-wan
+    ports:
+      - "${GLOBAL_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  failover-controller:
+    build:
+      context: ./controllers/failover
+      dockerfile: Dockerfile
+    image: ha-data-platform-failover-controller:dev
+    container_name: failover-controller
+    hostname: failover-controller
+    profiles:
+      - global
+      - all
+    environment:
+      PRIMARY_ENDPOINT: "http://minio-a:9000/minio/health/live"
+      PRIMARY_HOST: "minio-a"
+      SECONDARY_HOST: "minio-b"
+      BACKEND_PORT: "9000"
+      GLOBAL_PROXY_URL: "http://global-proxy:8000/minio/health/live"
+      HEALTHCHECK_INTERVAL_SECONDS: ${HEALTHCHECK_INTERVAL_SECONDS:-2}
+      FAILOVER_THRESHOLD: ${FAILOVER_THRESHOLD:-3}
+      CONFIG_PATH: "/etc/nginx/conf.d/nginx.conf"
+      TEMPLATE_PATH: "/etc/nginx/conf.d/nginx.conf.template"
+      METRICS_FILE: "/var/log/metrics/failover_rto.log"
+      FAILURE_TIMESTAMP_FILE: "/var/log/metrics/failure.timestamp"
+      DOCKER_SOCKET: "/var/run/docker.sock"
+      PROXY_CONTAINER_NAME: "global-proxy"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/global:/etc/nginx/conf.d
+      - ./volumes/metrics:/var/log/metrics
+    networks:
+      - net-wan
+    depends_on:
+      - global-proxy
+    restart: unless-stopped
+
 networks:
   net-region-a:
     name: net-region-a
