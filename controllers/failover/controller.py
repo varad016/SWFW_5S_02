@@ -25,6 +25,7 @@ GLOBAL_PROXY_URL = os.getenv("GLOBAL_PROXY_URL", "http://global-proxy:8000/minio
 FAILOVER_THRESHOLD = int(os.getenv("FAILOVER_THRESHOLD", "3"))
 CHECK_INTERVAL = float(os.getenv("HEALTHCHECK_INTERVAL_SECONDS", "1.0"))
 PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT_SECONDS", "0.5"))
+BUCKET_NAME = os.getenv("BUCKET_NAME", "data-bucket")
 CONFIG_PATH = os.getenv("CONFIG_PATH", "/etc/nginx/conf.d/nginx.conf")
 TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "/etc/nginx/conf.d/nginx.conf.template")
 METRICS_FILE = os.getenv("METRICS_FILE", "/var/log/metrics/failover_rto.log")
@@ -57,6 +58,28 @@ def reload_nginx(container_name):
         return resp.status in (200, 204)
     except Exception as e:
         print(f"[ERROR] Failed to reload Nginx via Docker socket: {e}", flush=True)
+        return False
+
+
+def docker_exec(container_name, cmd):
+    """Executes a command inside a target container via the Docker Unix socket."""
+    try:
+        conn = UnixSocketHTTPConnection(DOCKER_SOCKET)
+        exec_body = json.dumps({"AttachStdout": True, "AttachStderr": True, "Cmd": cmd})
+        conn.request("POST", f"/containers/{container_name}/exec", body=exec_body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode())
+        exec_id = data.get("Id")
+        if not exec_id:
+            conn.close()
+            return False
+        start_body = json.dumps({"Detach": False, "Tty": False})
+        conn.request("POST", f"/exec/{exec_id}/start", body=start_body, headers={"Content-Type": "application/json"})
+        conn.getresponse().read()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to exec {cmd} in {container_name}: {e}", flush=True)
         return False
 
 
@@ -246,7 +269,12 @@ def main():
                 reloaded = reload_nginx(PROXY_CONTAINER_NAME)
                 print(f"[ACTION] Nginx config updated and reloaded: {reloaded}", flush=True)
 
-                # 3. Poll Global Proxy until first successful request
+                # 3. Demote secondary to standalone mode (remove replication rule so writes never block)
+                print(f"[FAILOVER] Removing replication rule on {SECONDARY_HOST} to ensure unblocked standalone writes...", flush=True)
+                demoted = docker_exec(SECONDARY_HOST, ["mc", "replicate", "rm", f"local/{BUCKET_NAME}", "--all", "--force"])
+                print(f"[ACTION] Replication rule removed on {SECONDARY_HOST}: {demoted}", flush=True)
+
+                # 4. Poll Global Proxy until first successful request
                 t_first_success = None
                 poll_start = time.time()
                 while time.time() - poll_start < 15:

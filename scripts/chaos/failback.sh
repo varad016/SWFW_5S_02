@@ -14,7 +14,7 @@
 set -eu
 
 BUCKET="${BUCKET_NAME:-data-bucket}"
-CHAOS_FLAG=".chaos-active"
+CHAOS_FLAG="${CHAOS_ACTIVE_FILE:-/tmp/.chaos-active}"
 PROXY_URL="http://localhost:8000"
 
 echo "=================================================================="
@@ -52,6 +52,24 @@ ARN_B=$(docker exec minio-b mc replicate ls local/"${BUCKET}" 2>/dev/null | awk 
 
 if [ -z "${ARN_B}" ]; then
   # Fallback to JSON parsing
+  ARN_B=$(docker exec minio-b mc replicate ls --json local/"${BUCKET}" 2>/dev/null | grep -o '"Bucket":"arn:minio:replication:[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+fi
+
+if [ -z "${ARN_B}" ]; then
+  echo "   Replication rule missing on minio-b (demoted during failover). Restoring replication rule..."
+  if [ -f .env ]; then
+    eval "$(grep -E '^(REPL_USER|REPL_PASSWORD|SYNC_REPLICATION)=' .env 2>/dev/null || true)"
+  fi
+  R_USER="${REPL_USER:-repl_service}"
+  R_PASS="${REPL_PASSWORD:-ha_local_repl_pass_654}"
+  SYNC_ARG=""
+  if [ "${SYNC_REPLICATION:-false}" = "true" ]; then
+    SYNC_ARG="--sync"
+  fi
+  docker exec minio-b mc replicate add local/"${BUCKET}" \
+    --remote-bucket "http://${R_USER}:${R_PASS}@minio-a:9000/${BUCKET}" \
+    --priority 1 ${SYNC_ARG} >/dev/null 2>&1 || true
+
   ARN_B=$(docker exec minio-b mc replicate ls --json local/"${BUCKET}" 2>/dev/null | grep -o '"Bucket":"arn:minio:replication:[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
 fi
 
@@ -129,10 +147,8 @@ echo "7. Resetting Failover Controller..."
 docker restart failover-controller >/dev/null
 
 # 8. Clear chaos active flag
-if [ -f "${CHAOS_FLAG}" ]; then
-  rm -f "${CHAOS_FLAG}"
-  echo "8. Cleared ${CHAOS_FLAG} flag."
-fi
+rm -f "${CHAOS_FLAG}" .chaos-active 2>/dev/null || true
+echo "8. Cleared chaos active flag."
 
 # 9. Verify proxy endpoint
 echo "9. Verifying Global Proxy status..."
