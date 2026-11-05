@@ -72,6 +72,14 @@ services:
     profiles:
       - global
       - all
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -f /etc/nginx/conf.d/nginx.conf ]; then
+          sed 's/$${BACKEND_HOST}/minio-a/g; s/$${BACKEND_PORT}/9000/g' /etc/nginx/conf.d/nginx.conf.template > /etc/nginx/conf.d/nginx.conf
+        fi
+        exec /docker-entrypoint.sh nginx -g 'daemon off;'
     volumes:
       - ./config/global:/etc/nginx/conf.d
     networks:
