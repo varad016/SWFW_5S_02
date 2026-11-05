@@ -63,7 +63,7 @@ Theoretical Detection from First Failure:
 ### 2.4 Writer Cadence & Startup Timing Note
 
 - In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark and chaos suites, the interval is overridden to fast-burst rates (e.g. `WRITER_INTERVAL=0.15` to `0.30s`). With curl execution latency (~4ms to 10ms), this yields an observed cadence of ~0.31s to 0.32s per write.
-- A 3.903-second gap observed between writes #2 and #3 in one initial run was traced to a WSL2 host VM CPU scheduling/memory reclamation pause that occurred immediately following the bulk deletion of 140 versioned objects. Curls for writes #2 and #3 completed in 9.6ms and 9.0ms respectively, confirming no storage engine or network hang. Subsequent clean runs confirmed steady ~0.31s intervals across all writes.
+- A 3.903-second gap observed between writes #2 and #3 in one initial run is unexplained, not reproduced in subsequent runs. Curls for writes #2 and #3 completed in 9.6ms and 9.0ms respectively. Subsequent clean runs confirmed steady ~0.31s intervals across all writes.
 
 ---
 
@@ -78,11 +78,11 @@ To measure true RPO without masking data loss via post-recovery replication:
 4. The writer is stopped.
 5. **Before restarting Region A**, `scripts/demo/rpo-check.sh` compares the list of objects that returned HTTP 200 in `writer.log` against the objects actually present on surviving Region B. Any acknowledged write missing on Region B represents true RPO data loss.
 
-### 3.2 Trial Inventory & Ambiguous Writes Analysis
+### 3.2 Trial Inventory & Ambiguous Writes Analysis (Possible Scenario)
 
 In earlier multi-trial tests, surviving objects on Region B were observed to exceed client-acknowledged writes by 3 objects:
 - **Investigation:** Detailed inspection confirmed these 3 items were leftover test artifacts from earlier smoke tests (`curl-test.txt`, `partition-test-obj.txt`, `proxy-test.txt`), as earlier cleanup targeted only `obj-*`.
-- **Ambiguous Writes (In-Doubt Writes):** When a crash occurs during request transit, writes that were processed by the primary and replicated to the secondary before the crash may return HTTP 502 Bad Gateway to the client because the connection severed before HTTP 200 reached the client. Automated audit confirmed that cleanup resets buckets completely before each run.
+- **Ambiguous Writes (Possible Scenario):** In theory, when a crash occurs during request transit, writes that were processed by the primary and replicated to the secondary before the crash could return HTTP 502 Bad Gateway to the client if the connection was severed before HTTP 200 reached the client, yet still exist on the secondary. In our empirical trials, no ambiguous writes were observed; all discrepancies were fully accounted for by leftover test artifacts from prior smoke tests. Complete bucket resets were added between trials to guarantee clean baseline states.
 
 ### 3.3 Replication Tradeoff Analysis (Baseline Network)
 
