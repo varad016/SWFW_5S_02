@@ -10,7 +10,7 @@ set -eu
 REGION="${1:-region-a}"
 METRICS_DIR="volumes/metrics"
 TIMESTAMP_FILE="${METRICS_DIR}/failure.timestamp"
-CHAOS_FLAG=".chaos-active"
+CHAOS_FLAG="${CHAOS_ACTIVE_FILE:-/tmp/.chaos-active}"
 
 mkdir -p "${METRICS_DIR}"
 

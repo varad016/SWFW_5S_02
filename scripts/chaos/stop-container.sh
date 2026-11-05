@@ -7,7 +7,7 @@
 set -eu
 
 CONTAINER="${1:-}"
-CHAOS_FLAG=".chaos-active"
+CHAOS_FLAG="${CHAOS_ACTIVE_FILE:-/tmp/.chaos-active}"
 
 if [ -z "${CONTAINER}" ]; then
   echo "Usage: $0 <container-name>"

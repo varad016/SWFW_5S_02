@@ -8,7 +8,7 @@ set -eu
 
 TARGET="${1:-minio-b}"
 NETWORK="net-wan"
-CHAOS_FLAG=".chaos-active"
+CHAOS_FLAG="${CHAOS_ACTIVE_FILE:-/tmp/.chaos-active}"
 
 echo "=================================================================="
 echo "== Chaos Resolution: Healing WAN Partition                      =="
