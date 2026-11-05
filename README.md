@@ -130,3 +130,23 @@ docker exec minio-a mc replicate status local/data-bucket
   ```bash
   ./scripts/chaos/failback.sh
   ```
+
+---
+
+## GitOps Continuous Deployment & Reconciliation
+
+The platform includes a host-based GitOps reconciler (`scripts/gitops/reconciler.sh`) that continuously enforces declared Git state against the active deployment:
+
+- **Isolated Deploy Clone:** The production/demo stack runs strictly from a separate clone (e.g. `~/deploy/SWFW_5S_02`), completely isolated from developer working directories.
+- **Chaos Gating:** Reconciler checks `/tmp/.chaos-active` and skips all reconciliation actions during active chaos experiments.
+- **Drift Detection & Reversal:** Any manual configuration edits inside the deploy clone are automatically reverted (`git checkout -- .` and `git clean`).
+- **Automated Deployment:** Pulls new commits from `origin/main` and runs `docker compose up -d` only upon detected drift or new commits.
+- **Generated Upstream Config:** The live Nginx proxy upstream file (`config/global/nginx.conf`) is generated at runtime from `nginx.conf.template` and excluded from git tracking.
+
+```bash
+# Run continuous reconciliation loop from deploy clone:
+./scripts/gitops/reconciler.sh
+
+# Run one-shot reconciliation check:
+./scripts/gitops/reconciler.sh --once
+```
