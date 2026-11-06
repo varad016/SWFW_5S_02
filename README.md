@@ -8,31 +8,51 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 
 ## Architecture Overview
 
-```
-                      Client Requests
-                             │
-                             ▼
-                [ Global Ingress Proxy ]
-                   (Nginx / Port 8000)
-                             │
-               ┌─────────────┴─────────────┐
-               │    net-wan (Backbone)     │
-               └─────────────┬─────────────┘
-                             │
-        ┌────────────────────┴────────────────────┐
-        ▼                                         ▼
-   [ Region A ]                              [ Region B ]
-net-region-a (172.28.10.0/24)             net-region-b (172.28.20.0/24)
-├── minio-a                               ├── minio-b
-│   (joined to net-wan)                       (joined to net-wan)
-└── volumes/region-a/minio-data           └── volumes/region-b/minio-data
+```mermaid
+flowchart TD
+    Client["Client / Traffic Generator"] -->|HTTP PUT/GET :8000| Proxy["Global Proxy (Nginx)"]
+
+    subgraph Host["Host Environment (Ubuntu / WSL2)"]
+        Reconciler["GitOps Reconciler (Host Daemon)"]
+        ChaosGate["Chaos Gate (/tmp/.chaos-active)"]
+        Reconciler -.->|Checks| ChaosGate
+        DockerSock["Docker Engine API (/var/run/docker.sock)"]
+    end
+
+    GitHub["Git Remote (origin/main)"] -->|Poll / Pull| Reconciler
+    Reconciler -->|docker compose up -d| DockerSock
+
+    subgraph GlobalLayer["Global Management Layer"]
+        Proxy
+        Controller["Failover Controller (Python Daemon)"]
+        Controller -->|Probe /minio/health/live :9000| MinioA
+        Controller -->|SIGHUP Reload via API| DockerSock
+        DockerSock -->|Update Upstream| Proxy
+    end
+
+    subgraph WAN["Simulated WAN Network (net-wan: 172.20.0.0/16)"]
+        Proxy -->|Route Active Traffic| MinioA
+        MinioA <-->|Bidirectional Replication| MinioB
+    end
+
+    subgraph RegionA["Fault Domain: Region A (net-region-a)"]
+        MinioA["minio-a (Primary S3 :9001)"]
+        VolA[("volumes/region-a/minio-data")]
+        MinioA --- VolA
+    end
+
+    subgraph RegionB["Fault Domain: Region B (net-region-b)"]
+        MinioB["minio-b (Standby S3 :9011)"]
+        VolB[("volumes/region-b/minio-data")]
+        MinioB --- VolB
+    end
 ```
 
 ### Components
-1. **Region A & B MinIO Storage:** Single-node S3-compatible instances with versioned buckets.
-2. **Replication Strategy:** Bidirectional active-active bucket replication using dedicated service accounts (`mc replicate add`) over `net-wan`. By default, replication operates in **asynchronous mode** for low write latency (~3.8ms), with synchronous mode (`--sync enable`) available as a zero-RPO configuration option.
-3. **Global Proxy & Failover:** Edge reverse proxy routing traffic to the active region with automatic failover tracking Recovery Time Objective (RTO).
-4. **GitOps Reconciler:** Background reconciler running on the host watching `origin/main` for drift management.
+1. **Region A & B MinIO Storage:** Single-node S3-compatible instances with versioned buckets (`data-bucket`).
+2. **Replication Strategy:** Bidirectional active-active bucket replication using dedicated service accounts over `net-wan`. By default, replication operates in **asynchronous mode** for low write latency (~3.8ms), with synchronous mode (`--sync enable`) available as a configuration option that enforces dual-node persistence while the remote peer is healthy.
+3. **Global Proxy & Failover:** Edge Nginx reverse proxy routing traffic to the active region with automated failover controller tracking Recovery Time Objective (RTO = ~3.49s).
+4. **GitOps Reconciler:** Continuous host-based reconciler running from an isolated clone (`~/deploy/SWFW_5S_02`) watching `origin/main` for drift management and chaos gating.
 
 ---
 
@@ -56,7 +76,9 @@ net-region-a (172.28.10.0/24)             net-region-b (172.28.20.0/24)
 
 > [!NOTE]
 > **Synchronous vs. Asynchronous Replication Guarantees:**
-> - **Synchronous Mode (`--sync enable`):** Guarantees zero data loss (RPO = 0) for all client-acknowledged writes. Writes to the primary block until the secondary replica acknowledges receipt; if the secondary or WAN link fails, writes fail (HTTP 502 / timeout) rather than returning un-replicated HTTP 200s. **Zero loss is guaranteed strictly for client-acknowledged (HTTP 200) writes.** Under network partitions, write availability drops to 0% (CP mode in CAP theorem).
+> - **Synchronous Mode (`--sync enable`):**
+>   - **When zero loss is guaranteed:** While the remote peer is healthy and reachable, PUT requests block until the replica is committed on both nodes (~6ms to 9ms latency), guaranteeing zero data loss (RPO = 0).
+>   - **Can sync ever ack a write the peer doesn't have? YES:** Under a network partition, the first write hangs for MinIO's internal replication connection timeout (~65s). If the client times out, the object is still committed locally on Region A (in-doubt/ambiguous write). Crucially, once the ~65s timeout trips, MinIO flags the peer as degraded/offline and **silently degrades to local-only asynchronous acknowledgement** for subsequent writes, returning HTTP 200 (~4ms) even though the peer has not received the data. If Region A crashes before the link heals and queues resync, those client-acknowledged writes are lost on failover (measured RPO = 1 object).
 > - **Asynchronous Mode (`--sync disable`):** Prioritizes write availability (AP mode) with ~4ms PUT latency. If the primary crashes while replication lag exists, writes remaining in the replication backlog buffer prior to the crash are lost upon failover (measured RPO of 14 objects under lag-injection).
 
 ---
@@ -91,6 +113,38 @@ docker exec minio-a mc replicate status local/data-bucket
 | **Region A Console** | `http://localhost:9002` | MinIO Web UI Console for Region A |
 | **Region B S3 API** | `http://localhost:9011` | Direct API endpoint for Region B |
 | **Region B Console** | `http://localhost:9012` | MinIO Web UI Console for Region B |
+
+---
+
+## Live Demo Runbook (End-to-End Walkthrough)
+
+To demonstrate the complete platform lifecycle live—from fresh clone to automated failover, true RPO measurement, disaster recovery failback, and GitOps drift self-healing—run these 8 commands in order:
+
+```bash
+# 1. Clone into isolated deploy directory and enter repository
+git clone https://github.com/varad016/SWFW_5S_02.git ~/deploy/SWFW_5S_02 && cd ~/deploy/SWFW_5S_02
+
+# 2. Configure environment credentials from template
+cp .env.example .env
+
+# 3. Launch full platform and start continuous GitOps reconciler in background
+docker compose --profile all up -d && ./scripts/gitops/reconciler.sh &
+
+# 4. Start live client traffic stream in background
+./scripts/demo/writer.sh &
+
+# 5. Inject hard crash on Region A (controller auto-failovers to Region B in ~3.49s)
+./scripts/chaos/kill-region.sh region-a
+
+# 6. Audit true pre-restart RPO on surviving Region B
+./scripts/demo/rpo-check.sh
+
+# 7. Execute safe manual failback (resyncs backlog bidirectionally and restores proxy)
+./scripts/chaos/failback.sh && ./scripts/demo/verify.sh
+
+# 8. Test GitOps drift self-healing (reverts unauthorized tampering and redeploys)
+echo "# unauthorized drift" >> compose/regions.yml && ./scripts/gitops/reconciler.sh --once
+```
 
 ---
 
