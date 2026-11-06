@@ -10,7 +10,7 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 
 | Metric / Scenario | Measured Value (Median & Range) | Test Conditions | Observed Behavior / Guarantees |
 | :--- | :--- | :--- | :--- |
-| **Failover RTO** | **Overall Range: 3.31 s - 4.91 s** (8 runs recorded)<br>Mode 1 (3.0s det, instant refusal): 3 runs (3.31s - 3.49s)<br>Mode 2 (3.5s det, timeout): 5 runs (median: 4.87s, range: 4.86s - 4.91s) | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s | Automated switchover to Region B; switchover is ~0.37s on clean replica demotion (~0.01s if already standalone) |
+| **Failover RTO** | **Overall Range: 3.31 s - 4.91 s** (9 runs recorded)<br>Mode 1 (3.0s det): 3 runs (3.31s - 3.49s)<br>Mode 2 (3.5s det): 6 runs (median: 4.87s, range: 4.52s - 4.91s)<br>**Client Outage Gap: 6.03 s** | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s | Controller detects failure in 3.0s - 3.5s; in-flight client write waits ~4.4s on dead upstream before 502, creating 6.03s total client write gap |
 | **Async RPO (Lag Test)** | **14 objects missing from B at failover** | Active WAN partition on `minio-b` (3.5s duration), 0.3s write burst cadence (3 trials) | Under active WAN partition + primary crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
 | **Sync RPO (Direct Test)** | **1 object lost** | Direct PUT to primary with 60s timeout, mid-stream WAN partition on `minio-b` (66s duration), then kill primary (3 trials) | Initial partition write hangs ~66s; peer marked offline; subsequent write returns HTTP 200 locally (~4ms), missing from Region B at failover |
 | **Failback Behavior** | **Eventual Consistency** (0 discrepancy) | Post-disaster recovery, bidirectional resync `A -> B` and `B -> A` | Manual by design; bidirectional resync recovers stranded partition and failover writes (100% convergence) |
@@ -58,6 +58,7 @@ flowchart TD
     Controller -->|SIGHUP via Docker API| DockerSock
     Controller -.->|Reloads Upstream Config| Proxy
     Proxy -->|Route Active Traffic| MinioA
+    Proxy -.->|after failover| MinioB
     MinioA <-->|Bidirectional Replication over net-wan| MinioB
     MinioA --- VolA
     MinioB --- VolB
@@ -96,8 +97,12 @@ flowchart TD
 > Both fault domains (`region-a` and `region-b`), the simulated WAN bridge network (`net-wan`), the edge reverse proxy, and the failover controller run on a single physical host machine inside Docker bridge networks.
 
 > [!NOTE]
-> **6. Startup Provisioning & Client Writer Timing:**
-> Concurrent execution of `minio-provision` during stack startup locking bucket replication metadata is the likely cause (one clean run, 3 writes) for any initial write delay. Calling `docker wait minio-provision` before launching client traffic ensures steady write cadence (~1.01s intervals).
+> **6. Client Writer Cadence & Startup Timing Note:**
+> In early tests, a ~4-second gap occurred between writes #2 and #3. An earlier hypothesis that concurrent `minio-provision` execution locked bucket metadata was **disproven**: in subsequent runs, the delay persisted while individual request curl latency was only ~7.6ms, confirming the delay occurs in client loop execution/host scheduling, not server request blocking. Instrumented timing across step execution on idle stacks and with reconciler active demonstrated steady ~1.01s cadences; the sporadic ~4s loop iteration delay remains **cause undetermined** (likely host/WSL2 process scheduling jitter).
+
+> [!NOTE]
+> **7. Client-Visible Outage Gap (6.03s) vs. Controller RTO (~3.3s - 3.5s):**
+> While the failover controller detects failure and reconfigures upstream proxy routing in 3.0s to 3.5s (controller RTO = 3.32s - 3.47s), the client-visible write outage gap in `writer.log` was **6.03 seconds**. This delta occurs because an in-flight client write hitting Region A right at crash time waits **~4.4 seconds** before Nginx terminates the request with HTTP 502. This hold duration is governed by the Nginx configuration: `resolver 127.0.0.11 valid=2s;` (dynamic variable `$backend_upstream` DNS TTL revalidation on dying container) combined with `proxy_connect_timeout 1s;` and Nginx upstream connection retry cycles. Once the 502 returns and the proxy reloads, the next write succeeds immediately on Region B.
 
 > [!IMPORTANT]
 > **Manual Failback by Design:**
@@ -172,6 +177,20 @@ docker logs failover-controller | grep -E "FAILOVER|Detection|Switchover|RTO"
 
 # 10. Test GitOps drift self-healing (tamper README.md and verify automatic rollback)
 echo "# unauthorized drift" >> README.md && ./scripts/gitops/reconciler.sh --once
+
+# 11. Test continuous GitOps deployment via upstream push
+# With the reconciler running in the background, make a configuration change in dev:
+# In DEV working tree (~/SWFW_5S_02):
+#   sed -i 's/platform.environment=production-ha/platform.environment=production-ha-v2/' docker-compose.yml
+#   git commit -am "chore(deploy): bump environment label to v2"
+#   git push origin main (pushed from VS Code or git CLI)
+#
+# In deploy clone (~/deploy/SWFW_5S_02), the background reconciler detects and applies the change:
+#   [GITOPS] New commit detected upstream: <old_sha> -> <new_sha>
+#   [GITOPS] Pulling latest changes from origin/main...
+#   [GITOPS] Reconciling Docker Compose services to match desired state...
+# Verify the new label is live on the running container:
+docker inspect global-proxy --format '{{index .Config.Labels "platform.environment"}}'
 ```
 
 ### Optional: Replication Lag & Data Loss Scenario (Non-Zero RPO)

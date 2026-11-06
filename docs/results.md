@@ -60,49 +60,61 @@ Theoretical Detection from First Failure:
 - Switchover Time: **0.3721 seconds** (re-write Nginx upstream + Docker socket SIGHUP).
 - Total RTO: **3.4862 seconds**.
 
-### 2.4 Multi-Trial Clean-State RTO Benchmark & Detection Modes
+### 2.4 Run-by-Run RTO Benchmark Table & Detection Mode Hypothesis
 
-Across all 8 failure injection runs recorded so far (Phase 2 baseline, 5 clean benchmark trials, and 2 live rehearsals), failure detection operates in two distinct, deterministic modes depending on socket behavior on the initial probe:
+Across all 9 failover injection runs recorded across the platform (Phase 2 baseline, 5 clean benchmark trials, and 3 live rehearsals), failure detection falls into two observed timing patterns:
 
-1. **Mode 1 (3.0s Detection - Instant Connection Refused):**
-   - **Mechanism:** Probe 1 hits the killed container's port immediately after the OS closes the socket, resulting in an instant `ConnectionRefusedError` (0.24ms) without waiting for probe timeout. Probes 2 and 3 then hit their 0.5s timeout spaced by 1.0s intervals: `0.0s + 1.0s + 0.5s + 1.0s + 0.5s = 3.00 seconds`.
-   - **Observed Frequency:** **3 runs** (Phase 2 baseline run, Rehearsal 1, Rehearsal 2).
-   - **Detection Latency:** ~3.00s from first fail (3.11s - 3.30s from crash).
-   - **Total RTO:** **3.31s - 3.49s** (switchover 0.01s - 0.37s).
+| Run # / Scenario | Detection from First Fail (s) | Switchover Duration (s) | Total RTO (s) | Mode |
+|---|---|---|---|---|
+| **Phase 2 Baseline** | 3.0040 | 0.3721 | 3.4862 | Mode 1 |
+| **Clean Trial 1** | 3.5046 | 0.3711 | 4.9059 | Mode 2 |
+| **Clean Trial 2** | 3.5036 | 0.3657 | 4.8570 | Mode 2 |
+| **Clean Trial 3** | 3.5041 | 0.3714 | 4.8871 | Mode 2 |
+| **Clean Trial 4** | 3.5041 | 0.3798 | 4.8730 | Mode 2 |
+| **Clean Trial 5** | 3.5036 | 0.3608 | 4.8655 | Mode 2 |
+| **Rehearsal 1 (Initial)** | 3.5050 | 0.0110 | 4.5160 | Mode 2 |
+| **Rehearsal 2 (Mid-Stream)** | 3.0040 | 0.0210 | 3.3200 | Mode 1 |
+| **Rehearsal 3 (Full Log)** | 3.0030 | 0.3600 | 3.4660 | Mode 1 |
+| **Summary Across 9 Runs** | **Range: 3.003 s – 3.505 s** | **Range: 0.011 s – 0.380 s** | **Range: 3.31 s – 4.91 s** | **Mode 1: 3 runs<br>Mode 2: 6 runs** |
 
-2. **Mode 2 (3.5s Detection - Initial Probe Timeout):**
-   - **Mechanism:** Probe 1 was already in-flight or the socket silently drops SYN packets during teardown, causing all 3 probes to wait the full 0.5s timeout: `3 * 0.5s + 2 * 1.0s = 3.50 seconds`.
-   - **Observed Frequency:** **5 runs** (the 5 clean-state benchmark trials).
-   - **Detection Latency:** ~3.50s from first fail (4.49s - 4.53s from crash).
-   - **Total RTO:** **4.86s - 4.91s** (switchover 0.36s - 0.38s).
+#### Detection Mode Hypothesis (Unproven)
 
-**Overall RTO Summary Across ALL 8 Runs:**
-- **Total RTO Range:** **3.31 s – 4.91 s** (Mode 1 count: 3; Mode 2 count: 5).
-- **Detection from First Fail Range:** **3.004 s – 3.505 s**.
-- **Switchover Time Range:** **0.011 s – 0.380 s** (~0.37s when demoting active replica via `mc replicate rm`; ~0.01s if already demoted).
-
-#### 5-Trial Clean-State Benchmark Table (Mode 2 Runs)
-
-To evaluate worst-case timeout behavior under repeatable conditions, 5 consecutive trials were recorded with active bidirectional replication:
-
-| Trial # | Mode | Detection from First Fail (s) | Detection from Crash (s) | Switchover Duration (s) | Total RTO (s) |
-|---|---|---|---|---|---|
-| **Trial 1** | Mode 2 | 3.5046 | 4.5348 | 0.3711 | 4.9059 |
-| **Trial 2** | Mode 2 | 3.5036 | 4.4913 | 0.3657 | 4.8570 |
-| **Trial 3** | Mode 2 | 3.5041 | 4.5156 | 0.3714 | 4.8871 |
-| **Trial 4** | Mode 2 | 3.5041 | 4.4932 | 0.3798 | 4.8730 |
-| **Trial 5** | Mode 2 | 3.5036 | 4.5048 | 0.3608 | 4.8655 |
-| **Summary** | **Mode 2 (5 trials)** | **Median: 3.5041 s** (Range: 3.5036s - 3.5046s) | **Median: 4.5048 s** (Range: 4.4913s - 4.5348s) | **Median: 0.3711 s** (Range: 0.3608s - 0.3798s) | **Median: 4.8730 s** (Range: 4.8570s - 4.9059s) |
+The underlying cause for the two detection latencies (~3.0s vs. ~3.5s) is considered an **unproven hypothesis**:
+1. **Mode 1 Hypothesis (3.0s Detection — 3 runs):**
+   - Probe 1 hits the killed container's socket immediately after the kernel closes the port, receiving an instant `ConnectionRefusedError` (0.24ms) without waiting for a timeout. Probes 2 and 3 then hit their 0.5s timeout separated by 1.0s intervals: `0.0s + 1.0s + 0.5s + 1.0s + 0.5s = 3.00 seconds`.
+2. **Mode 2 Hypothesis (3.5s Detection — 6 runs):**
+   - Probe 1 was already in-flight or the socket dropped packets during container termination, causing all 3 probes to wait the full 0.5s probe timeout: `3 * 0.5s + 2 * 1.0s = 3.50 seconds`.
 
 **Switchover Duration Analysis (~0.37s vs. ~0.011s):**
-- In a **clean primary state** where Region B has an active cross-region replication rule, the failover controller executes `mc replicate rm local/data-bucket --all --force` via the Docker Engine API to demote Region B to standalone mode. The time spent by `mc` initializing, authenticating, and persisting updated bucket replication metadata on disk (~0.36s to 0.38s) is considered the **likely cause (not proven)** for the ~0.37s switchover.
-- In runs where Region B was **already standalone** (no active replication rule present on Region B), `mc replicate rm` returned almost immediately without updating metadata, reducing the switchover duration to **~0.011s** (measuring solely Nginx template re-write and SIGHUP reload).
+- In runs with an **active cross-region replica**, the controller executes `mc replicate rm local/data-bucket --all --force` via the Docker Engine API to demote Region B to standalone mode. The time spent by `mc` initializing, authenticating, and persisting updated metadata on disk (~0.36s to 0.38s) is considered the **likely cause (not proven)** for the ~0.37s switchover.
+- In runs where Region B was **already standalone**, `mc replicate rm` returned immediately, yielding **~0.011s – 0.021s** switchover (solely Nginx template re-write and SIGHUP reload).
 
-### 2.5 Writer Cadence & Startup Timing Note
+### 2.5 Client-Visible Outage Gap (6.03s) vs. Controller RTO (3.47s)
 
-- In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark suites, the interval is overridden to fast-burst rates (`WRITER_INTERVAL=0.15` to `0.30s`).
-- **Startup Stall Between Writes #2 and #3 (Reproduced and Investigated):**
-  In both initial testing and the live rehearsal (`09:52:15` to `09:52:19`), a ~3.97-second gap was observed between writes #2 and #3. Nginx access logs and curl `-w` timing confirmed curl execution latency remained fast (8.0ms). Concurrent execution of the GitOps reconciler / `minio-provision` container initializing cross-region replication configuration and locking bucket replication metadata during stack startup is considered the **likely cause (one clean run, 3 writes)**. Note that the very first occurrence of this stall in earlier smoke testing occurred immediately following a bulk delete operation and may differ. When writer tests are executed after provisioning completes (`docker wait minio-provision`), all writes proceed steadily at ~1.01s intervals with zero stalls.
+In the full-stream rehearsal, the controller recorded a total failover RTO of **3.466s** (detection: 3.107s, switchover: 0.360s). However, the client-visible gap between successful writes in `writer.log` was **6.03 seconds** (last success on A at `10:43:22Z`, first success on B at `10:43:28Z`).
+
+This delta occurs because in-flight write `obj-00006` started right at the moment of container crash (`10:43:23Z`) and was held for **4,365.5 ms** before returning `HTTP 502 Bad Gateway`:
+- **Nginx Upstream Hold Configuration:**
+  In `config/global/nginx.conf.template`:
+  ```nginx
+  resolver 127.0.0.11 valid=2s ipv6=off;
+  set $backend_upstream http://${BACKEND_HOST}:${BACKEND_PORT};
+  location / {
+      proxy_pass $backend_upstream;
+      proxy_connect_timeout 1s;
+      proxy_read_timeout 30s;
+      proxy_send_timeout 30s;
+  }
+  ```
+- **Hold Mechanism:** Using a dynamic variable `$backend_upstream` forces Nginx to query the Docker internal DNS resolver `127.0.0.11` on every request according to the `valid=2s` TTL. When `minio-a` crashes, DNS resolution attempts, combined with `proxy_connect_timeout 1s` and upstream connection retry cycles, hold the client request for ~4.4s before generating a `502 Bad Gateway`. Once the 502 is received and the proxy reloads upstream to `minio-b`, writes resume immediately with 3.7ms latency.
+
+### 2.6 Startup Stall Investigation & Per-Step Trace
+
+- **Correction on Earlier Claim:** In an earlier run, `docker wait minio-provision` appeared to eliminate the ~4s stall. However, in the subsequent full rehearsal, writes #2 (`10:43:16Z`) and #3 (`10:43:20Z`) were spaced ~4 seconds apart despite `docker wait minio-provision`. Because the logged curl latency for write #3 was only **7.6 ms**, the delay was conclusively **not a request blocked on a server-side metadata lock**.
+- **Per-Step Instrumentation:** `scripts/demo/writer.sh` was instrumented with microsecond timestamps (`$EPOCHREALTIME`) around each loop phase (variable preparation, curl execution, awk parsing, log append, and sleep duration) and evaluated under two controlled environments:
+  1. **Run (a) — Idle Stack with No Reconciler:** All 8 writes executed at steady ~1.01s – 1.02s intervals (loop duration ~1020ms; sleep=1001ms, curl=7-17ms, parse=4-7ms). No stall observed.
+  2. **Run (b) — Stack Right After Starting Reconciler:** All 8 writes executed at steady ~1.02s – 1.03s intervals. No stall observed.
+- **Conclusion:** Because the delay occurs sporadically inside the client script loop execution without increasing curl network latency, and cannot be reproduced under controlled step tracing, the cause remains **cause undetermined** (likely host OS / WSL2 process scheduling jitter during heavy disk I/O, not a platform bug).
 
 ---
 
