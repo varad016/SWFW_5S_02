@@ -69,6 +69,8 @@ services:
     image: nginx@sha256:208b70eefac13ee9be00e486f79c695b15cef861c680527171a27d253d834be9
     container_name: global-proxy
     hostname: global-proxy
+    labels:
+      - "platform.environment=production-ha"
     profiles:
       - global
       - all

@@ -11,9 +11,9 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 | Metric / Scenario | Measured Value (Median & Range) | Test Conditions | Observed Behavior / Guarantees |
 | :--- | :--- | :--- | :--- |
 | **Failover RTO** | **Median: 4.87 s** (Range: 4.86s - 4.91s)<br>Detection: 3.50s (range: 3.503s - 3.505s)<br>Switchover: 0.37s (range: 0.361s - 0.380s) | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s (5 trials) | Automated switchover to Region B; switchover is ~0.37s on clean replica demotion (~0.01s if already standalone) |
-| **Async RPO (Lag Test)** | **14 objects lost** | Active WAN partition on `minio-b` (3.5s duration), 0.3s write burst cadence (3 trials) | Under active WAN partition + primary crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
+| **Async RPO (Lag Test)** | **14 objects missing from B at failover** | Active WAN partition on `minio-b` (3.5s duration), 0.3s write burst cadence (3 trials) | Under active WAN partition + primary crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
 | **Sync RPO (Direct Test)** | **1 object lost** | Direct PUT to primary with 60s timeout, mid-stream WAN partition on `minio-b` (66s duration), then kill primary (3 trials) | Initial partition write hangs ~66s; peer marked offline; subsequent write returns HTTP 200 locally (~4ms), missing from Region B at failover |
-| **Failback Behavior** | **Eventual Consistency** (0 discrepancy) | Post-disaster recovery, bidirectional resync `A -> B` and `B -> A` (5 trials) | Manual by design; bidirectional resync recovers stranded partition and failover writes (100% convergence) |
+| **Failback Behavior** | **Eventual Consistency** (0 discrepancy) | Post-disaster recovery, bidirectional resync `A -> B` and `B -> A` | Manual by design; bidirectional resync recovers stranded partition and failover writes (100% convergence) |
 
 ---
 
@@ -21,48 +21,52 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 
 ```mermaid
 flowchart TD
-    Client["Client / Traffic Generator"] -->|HTTP PUT/GET :8000| Proxy["Global Proxy (Nginx)"]
+    subgraph ClientLayer["Client Layer"]
+        Client["Client / Traffic Generator"]
+    end
 
     subgraph Host["Host Environment (Ubuntu / WSL2)"]
         Reconciler["GitOps Reconciler (Host Daemon)"]
         ChaosGate["Chaos Gate (/tmp/.chaos-active)"]
-        Reconciler -.->|Checks| ChaosGate
         DockerSock["Docker Engine API (/var/run/docker.sock)"]
     end
 
-    GitHub["Git Remote (origin/main)"] -->|Poll / Pull| Reconciler
-    Reconciler -->|docker compose up -d| DockerSock
-
-    subgraph GlobalLayer["Global Management Layer"]
-        Proxy
-        Controller["Failover Controller (Python Daemon)"]
-        Controller -->|Probe /minio/health/live :9000| MinioA
-        Controller -->|SIGHUP Reload via API| DockerSock
-        DockerSock -->|Update Upstream| Proxy
+    subgraph Remote["Remote Version Control"]
+        GitHub["Git Remote (origin/main)"]
     end
 
-    subgraph WAN["Simulated WAN Network (net-wan: 172.20.0.0/16)"]
-        Proxy -->|Route Active Traffic| MinioA
-        MinioA <-->|Bidirectional Replication| MinioB
+    subgraph GlobalLayer["Global Management Layer"]
+        Proxy["Global Proxy (Nginx)"]
+        Controller["Failover Controller (Python Daemon)"]
     end
 
     subgraph RegionA["Fault Domain: Region A (net-region-a)"]
         MinioA["minio-a (Primary S3 :9001)"]
         VolA[("volumes/region-a/minio-data")]
-        MinioA --- VolA
     end
 
     subgraph RegionB["Fault Domain: Region B (net-region-b)"]
         MinioB["minio-b (Standby S3 :9011)"]
         VolB[("volumes/region-b/minio-data")]
-        MinioB --- VolB
     end
+
+    Client -->|HTTP PUT/GET :8000| Proxy
+    GitHub -->|Poll / Pull| Reconciler
+    Reconciler -.->|Checks| ChaosGate
+    Reconciler -->|docker compose up -d| DockerSock
+    Controller -->|Probe /minio/health/live :9000| MinioA
+    Controller -->|SIGHUP via Docker API| DockerSock
+    Controller -.->|Reloads Upstream Config| Proxy
+    Proxy -->|Route Active Traffic| MinioA
+    MinioA <-->|Bidirectional Replication over net-wan| MinioB
+    MinioA --- VolA
+    MinioB --- VolB
 ```
 
 ### Components
 1. **Region A & B MinIO Storage:** Single-node S3-compatible instances with versioned buckets (`data-bucket`).
 2. **Replication Strategy:** Bidirectional active-active bucket replication using dedicated service accounts over `net-wan`. By default, replication operates in **asynchronous mode** for low write latency (~3.8ms), with synchronous mode (`--sync enable`) available as a configuration option that enforces dual-node persistence while the remote peer is healthy.
-3. **Global Proxy & Failover:** Edge Nginx reverse proxy routing traffic to the active region with automated failover controller tracking Recovery Time Objective (RTO = ~3.49s).
+3. **Global Proxy & Failover:** Edge Nginx reverse proxy routing traffic to the active region with automated failover controller tracking Recovery Time Objective (median RTO = 4.87s, range: 4.86s - 4.91s).
 4. **GitOps Reconciler:** Continuous host-based reconciler running from an isolated clone (`~/deploy/SWFW_5S_02`) watching `origin/main` for drift management and chaos gating.
 
 ---
@@ -138,25 +142,31 @@ To demonstrate the complete platform lifecycle live in the deploy clone (`~/depl
 # 1. Navigate to deploy directory and launch full platform
 cd ~/deploy/SWFW_5S_02 && docker compose --profile all up -d
 
-# 2. Start continuous GitOps reconciler in background
+# 2. Wait for background provisioning container to complete
+docker wait minio-provision
+
+# 3. Clean-reset buckets via containers (no sudo needed) and verify both empty
+docker exec minio-a mc rm --recursive --force --versions local/data-bucket/ && docker exec minio-b mc rm --recursive --force --versions local/data-bucket/ && docker exec minio-a mc ls local/data-bucket/ && docker exec minio-b mc ls local/data-bucket/
+
+# 4. Start continuous GitOps reconciler in background
 ./scripts/gitops/reconciler.sh &
 
-# 3. Start live client traffic stream in background
+# 5. Start live client traffic stream in background
 ./scripts/demo/writer.sh &
 
-# 4. Inject hard crash on Region A (controller auto-failovers to Region B in ~3.49s)
+# 6. Inject hard crash on Region A (controller auto-failovers to Region B; median RTO: 4.87s)
 ./scripts/chaos/kill-region.sh region-a
 
-# 5. Inspect controller logs for measured failover detection and RTO switchover timing
+# 7. Inspect controller logs for measured failover detection, switchover, and total RTO
 docker logs failover-controller | grep -E "FAILOVER|Detection|Switchover|RTO"
 
-# 6. Stop writer stream and audit true pre-restart RPO on surviving Region B
-pkill -f writer.sh && ./scripts/demo/rpo-check.sh
+# 8. Stop writer stream and audit true pre-restart RPO on surviving Region B
+(pkill -f writer.sh || true) && ./scripts/demo/rpo-check.sh
 
-# 7. Execute safe manual failback (resyncs backlog bidirectionally and restores proxy)
+# 9. Execute safe manual failback (resyncs backlog bidirectionally and restores proxy)
 ./scripts/chaos/failback.sh && ./scripts/demo/verify.sh
 
-# 8. Test GitOps drift self-healing (tamper README.md and verify automatic rollback)
+# 10. Test GitOps drift self-healing (tamper README.md and verify automatic rollback)
 echo "# unauthorized drift" >> README.md && ./scripts/gitops/reconciler.sh --once
 ```
 

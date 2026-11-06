@@ -58,7 +58,7 @@ Theoretical Detection from First Failure:
 - Detection Latency from First Fail: **3.0040 seconds** (matches theoretical 3.00s model).
 - Detection Latency from Crash: **3.1141 seconds**.
 - Switchover Time: **0.3721 seconds** (re-write Nginx upstream + Docker socket SIGHUP).
-- Total RTO: **3.4862 seconds**.
+- Total RTO: **3.4862 seconds** (Note: this was a single lucky run where probe 1 got instant ConnectionRefusedError; headline benchmark RTO is median 4.87s).
 
 ### 2.4 Multi-Trial Clean-State RTO Benchmark (5 Consecutive Trials)
 
@@ -74,14 +74,14 @@ To rigorously validate RTO consistency, 5 consecutive trials of the hard crash f
 | **Summary** | **Median: 3.5041 s** (Range: 3.5036s - 3.5046s) | **Median: 4.5048 s** (Range: 4.4913s - 4.5348s) | **Median: 0.3711 s** (Range: 0.3608s - 0.3798s) | **Median: 4.8730 s** (Range: 4.8570s - 4.9059s) |
 
 **Switchover Duration Analysis (~0.37s vs. ~0.011s):**
-- In a **clean primary state** where Region B has an active cross-region replication rule, the failover controller executes `mc replicate rm local/data-bucket --all --force` via the Docker Engine API to demote Region B to standalone mode. Initializing `mc` in `minio-b`, authenticating, connecting to the local MinIO daemon, and persisting updated bucket replication metadata on disk takes **~0.36s to 0.38s**.
+- In a **clean primary state** where Region B has an active cross-region replication rule, the failover controller executes `mc replicate rm local/data-bucket --all --force` via the Docker Engine API to demote Region B to standalone mode. The time spent by `mc` initializing, authenticating, and persisting updated bucket replication metadata on disk (~0.36s to 0.38s) is considered the **likely cause (not proven)** for the ~0.37s switchover.
 - In runs where Region B was **already standalone** (no active replication rule present on Region B), `mc replicate rm` returned almost immediately without updating metadata, reducing the switchover duration to **~0.011s** (measuring solely Nginx template re-write and SIGHUP reload).
 
 ### 2.5 Writer Cadence & Startup Timing Note
 
 - In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark suites, the interval is overridden to fast-burst rates (`WRITER_INTERVAL=0.15` to `0.30s`).
-- **Startup Stall Between Writes #2 and #3 (Reproduced and Identified):**
-  In both initial testing and the live rehearsal (`09:52:15` to `09:52:19`), a ~3.97-second gap was observed between writes #2 and #3. Nginx access logs and curl `-w` timing confirmed curl execution latency remained fast (8.0ms). However, the loop iteration stall occurred when the writer was started immediately after stack launch while the GitOps reconciler / `minio-provision` container was running concurrently. During this startup window, `minio-provision` connects to `minio-a` and `minio-b` to initialize cross-region replication configuration, acquiring locks on bucket replication metadata. When writer tests are executed after provisioning completes, all writes proceed steadily at ~1.01s intervals with zero stalls.
+- **Startup Stall Between Writes #2 and #3 (Reproduced and Investigated):**
+  In both initial testing and the live rehearsal (`09:52:15` to `09:52:19`), a ~3.97-second gap was observed between writes #2 and #3. Nginx access logs and curl `-w` timing confirmed curl execution latency remained fast (8.0ms). Concurrent execution of the GitOps reconciler / `minio-provision` container initializing cross-region replication configuration and locking bucket replication metadata during stack startup is considered the **likely cause**. Note that the very first occurrence of this stall in earlier smoke testing occurred immediately following a bulk delete operation and may differ. When writer tests are executed after provisioning completes, all writes proceed steadily at ~1.01s intervals with zero stalls.
 
 ---
 
