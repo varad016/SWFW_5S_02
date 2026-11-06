@@ -72,10 +72,10 @@ Across all 9 failover injection runs recorded across the platform (Phase 2 basel
 | **Clean Trial 3** | 3.5041 | 0.3714 | 4.8871 | Mode 2 |
 | **Clean Trial 4** | 3.5041 | 0.3798 | 4.8730 | Mode 2 |
 | **Clean Trial 5** | 3.5036 | 0.3608 | 4.8655 | Mode 2 |
-| **Rehearsal 1 (Initial)** | 3.5050 | 0.0110 | 4.5160 | Mode 2 |
+| **Rehearsal 1 (Initial)** | 3.5050 | 0.0110 | 3.9370 | Mode 2 |
 | **Rehearsal 2 (Mid-Stream)** | 3.0040 | 0.0210 | 3.3200 | Mode 1 |
 | **Rehearsal 3 (Full Log)** | 3.0030 | 0.3600 | 3.4660 | Mode 1 |
-| **Summary Across 9 Runs** | **Range: 3.003 s – 3.505 s** | **Range: 0.011 s – 0.380 s** | **Range: 3.31 s – 4.91 s** | **Mode 1: 3 runs<br>Mode 2: 6 runs** |
+| **Summary Across 9 Runs** | **Range: 3.003 s – 3.505 s** | **Range: 0.011 s – 0.380 s** | **Range: 3.32 s – 4.91 s** | **Mode 1: 3 runs<br>Mode 2: 6 runs** |
 
 #### Detection Mode Hypothesis (Unproven)
 
@@ -106,7 +106,7 @@ This delta occurs because in-flight write `obj-00006` started right at the momen
       proxy_send_timeout 30s;
   }
   ```
-- **Hold Mechanism:** Using a dynamic variable `$backend_upstream` forces Nginx to query the Docker internal DNS resolver `127.0.0.11` on every request according to the `valid=2s` TTL. When `minio-a` crashes, DNS resolution attempts, combined with `proxy_connect_timeout 1s` and upstream connection retry cycles, hold the client request for ~4.4s before generating a `502 Bad Gateway`. Once the 502 is received and the proxy reloads upstream to `minio-b`, writes resume immediately with 3.7ms latency.
+- **Hold Mechanism (Likely, Untested):** Using a dynamic variable `$backend_upstream` forces Nginx to query the Docker internal DNS resolver `127.0.0.11` on every request according to the `valid=2s` TTL. When `minio-a` crashes, DNS resolution attempts, combined with `proxy_connect_timeout 1s` and upstream connection retry cycles, is considered a **likely, untested** explanation for the ~4.4s hold before generating a `502 Bad Gateway`. Crucially, in write #6, the 502 returned after the upstream configuration had already been repointed to Region B and reloaded, which the DNS/connect-timeout explanation does not fully account for. Once the 502 returned to the client, the next write (`obj-00007`) succeeded immediately on Region B with 3.7ms latency.
 
 ### 2.6 Startup Stall Investigation & Per-Step Trace
 
@@ -114,7 +114,7 @@ This delta occurs because in-flight write `obj-00006` started right at the momen
 - **Per-Step Instrumentation:** `scripts/demo/writer.sh` was instrumented with microsecond timestamps (`$EPOCHREALTIME`) around each loop phase (variable preparation, curl execution, awk parsing, log append, and sleep duration) and evaluated under two controlled environments:
   1. **Run (a) — Idle Stack with No Reconciler:** All 8 writes executed at steady ~1.01s – 1.02s intervals (loop duration ~1020ms; sleep=1001ms, curl=7-17ms, parse=4-7ms). No stall observed.
   2. **Run (b) — Stack Right After Starting Reconciler:** All 8 writes executed at steady ~1.02s – 1.03s intervals. No stall observed.
-- **Conclusion:** Because the delay occurs sporadically inside the client script loop execution without increasing curl network latency, and cannot be reproduced under controlled step tracing, the cause remains **cause undetermined** (likely host OS / WSL2 process scheduling jitter during heavy disk I/O, not a platform bug).
+- **Conclusion:** The stall occurred in 3 runs immediately after a fresh `docker compose up`; it was not reproduced on a warm, instrumented stack (which does not recreate those conditions); **cause undetermined**.
 
 ---
 

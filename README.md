@@ -10,7 +10,7 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 
 | Metric / Scenario | Measured Value (Median & Range) | Test Conditions | Observed Behavior / Guarantees |
 | :--- | :--- | :--- | :--- |
-| **Failover RTO** | **Overall Range: 3.31 s - 4.91 s** (9 runs recorded)<br>Mode 1 (3.0s det): 3 runs (3.31s - 3.49s)<br>Mode 2 (3.5s det): 6 runs (median: 4.87s, range: 4.52s - 4.91s)<br>**Client Outage Gap: 6.03 s** | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s | Controller detects failure in 3.0s - 3.5s; in-flight client write waits ~4.4s on dead upstream before 502, creating 6.03s total client write gap |
+| **Failover RTO** | **Overall Range: 3.32 s - 4.91 s** (9 runs recorded)<br>Mode 1 (3.0s det): 3 runs (3.32s - 3.49s)<br>Mode 2 (3.5s det): 6 runs (median: 4.87s, range: 3.94s - 4.91s)<br>**Client Outage Gap: 6.03 s** | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s | Controller detects failure in 3.0s - 3.5s; in-flight client write waits ~4.4s on dead upstream before 502, creating 6.03s total client write gap |
 | **Async RPO (Lag Test)** | **14 objects missing from B at failover** | Active WAN partition on `minio-b` (3.5s duration), 0.3s write burst cadence (3 trials) | Under active WAN partition + primary crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
 | **Sync RPO (Direct Test)** | **1 object lost** | Direct PUT to primary with 60s timeout, mid-stream WAN partition on `minio-b` (66s duration), then kill primary (3 trials) | Initial partition write hangs ~66s; peer marked offline; subsequent write returns HTTP 200 locally (~4ms), missing from Region B at failover |
 | **Failback Behavior** | **Eventual Consistency** (0 discrepancy) | Post-disaster recovery, bidirectional resync `A -> B` and `B -> A` | Manual by design; bidirectional resync recovers stranded partition and failover writes (100% convergence) |
@@ -67,7 +67,7 @@ flowchart TD
 ### Components
 1. **Region A & B MinIO Storage:** Single-node S3-compatible instances with versioned buckets (`data-bucket`).
 2. **Replication Strategy:** Bidirectional active-active bucket replication using dedicated service accounts over `net-wan`. By default, replication operates in **asynchronous mode** for low write latency (~3.8ms), with synchronous mode (`--sync enable`) available as a configuration option that enforces dual-node persistence while the remote peer is healthy.
-3. **Global Proxy & Failover:** Edge Nginx reverse proxy routing traffic to the active region with automated failover controller tracking Recovery Time Objective (median RTO = 4.87s, range: 4.86s - 4.91s).
+3. **Global Proxy & Failover:** Edge Nginx reverse proxy routing traffic to the active region with automated failover controller tracking Recovery Time Objective (clean benchmark median RTO = 4.87s, range: 4.86s – 4.91s; overall 9-run range: 3.32s – 4.91s).
 4. **GitOps Reconciler:** Continuous host-based reconciler running from an isolated clone (`~/deploy/SWFW_5S_02`) watching `origin/main` for drift management and chaos gating.
 
 ---
@@ -98,11 +98,12 @@ flowchart TD
 
 > [!NOTE]
 > **6. Client Writer Cadence & Startup Timing Note:**
-> In early tests, a ~4-second gap occurred between writes #2 and #3. An earlier hypothesis that concurrent `minio-provision` execution locked bucket metadata was **disproven**: in subsequent runs, the delay persisted while individual request curl latency was only ~7.6ms, confirming the delay occurs in client loop execution/host scheduling, not server request blocking. Instrumented timing across step execution on idle stacks and with reconciler active demonstrated steady ~1.01s cadences; the sporadic ~4s loop iteration delay remains **cause undetermined** (likely host/WSL2 process scheduling jitter).
+> In early tests, a ~4-second gap occurred between writes #2 and #3. An earlier hypothesis that concurrent `minio-provision` execution locked bucket metadata was **disproven**: in subsequent runs, the delay persisted while individual request curl latency was only ~7.6ms, confirming the delay was not a request blocked on a server-side lock. The stall occurred in 3 runs immediately after a fresh `docker compose up`; it was not reproduced on a warm, instrumented stack (which does not recreate those conditions); cause undetermined.
 
 > [!NOTE]
 > **7. Client-Visible Outage Gap (6.03s) vs. Controller RTO (~3.3s - 3.5s):**
-> While the failover controller detects failure and reconfigures upstream proxy routing in 3.0s to 3.5s (controller RTO = 3.32s - 3.47s), the client-visible write outage gap in `writer.log` was **6.03 seconds**. This delta occurs because an in-flight client write hitting Region A right at crash time waits **~4.4 seconds** before Nginx terminates the request with HTTP 502. This hold duration is governed by the Nginx configuration: `resolver 127.0.0.11 valid=2s;` (dynamic variable `$backend_upstream` DNS TTL revalidation on dying container) combined with `proxy_connect_timeout 1s;` and Nginx upstream connection retry cycles. Once the 502 returns and the proxy reloads, the next write succeeds immediately on Region B.
+> While the failover controller detects failure and reconfigures upstream proxy routing in 3.0s to 3.5s (controller RTO = 3.32s - 3.47s), the client-visible write outage gap in `writer.log` was **6.03 seconds**. This delta occurs because an in-flight client write hitting Region A right at crash time waits **~4.4 seconds** before Nginx terminates the request with HTTP 502.
+> - **Hold Explanation (Likely, Untested):** Nginx configuration with `resolver 127.0.0.11 valid=2s;` (dynamic variable `$backend_upstream` DNS TTL revalidation on dying container) combined with `proxy_connect_timeout 1s;` and upstream connection retry cycles is considered a **likely, untested** cause. Note that the 502 for write #6 returned after the upstream was already repointed to Region B, which this explanation does not fully account for. Once the 502 returns and the proxy reloads, the next write succeeds immediately on Region B.
 
 > [!IMPORTANT]
 > **Manual Failback by Design:**
@@ -151,8 +152,8 @@ To demonstrate the complete platform lifecycle live in the deploy clone (`~/depl
 # 1. Navigate to deploy directory and launch full platform
 cd ~/deploy/SWFW_5S_02 && docker compose --profile all up -d
 
-# 2. Wait for background provisioning container to complete
-docker wait minio-provision
+# 2. Wait for background provisioning container to complete and allow stack to settle
+docker wait minio-provision && sleep 20
 
 # 3. Clean-reset buckets via containers (no sudo needed) and verify both empty
 docker exec minio-a mc rm --recursive --force --versions local/data-bucket/ && docker exec minio-b mc rm --recursive --force --versions local/data-bucket/ && docker exec minio-a mc ls local/data-bucket/ && docker exec minio-b mc ls local/data-bucket/

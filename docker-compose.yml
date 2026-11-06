@@ -70,7 +70,7 @@ services:
     container_name: global-proxy
     hostname: global-proxy
     labels:
-      - "platform.environment=production-ha"
+      - "platform.environment=production-ha-v2"
     profiles:
       - global
       - all
