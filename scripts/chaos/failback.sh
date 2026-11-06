@@ -165,6 +165,7 @@ server {
 EOF
 
 if [ -d config/global ]; then
+  rm -f config/global/nginx.conf 2>/dev/null || true
   docker exec global-proxy cat /etc/nginx/conf.d/nginx.conf > config/global/nginx.conf 2>/dev/null || true
 fi
 
