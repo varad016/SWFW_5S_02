@@ -78,10 +78,10 @@ To measure true RPO without masking data loss via post-recovery replication:
 4. The writer is stopped.
 5. **Before restarting Region A**, `scripts/demo/rpo-check.sh` compares the list of objects that returned HTTP 200 in `writer.log` against the objects actually present on surviving Region B. Any acknowledged write missing on Region B represents true RPO data loss.
 
-### 3.2 Ambiguous Writes (In-Doubt Writes) & Baseline Audits
+### 3.2 Observed In-Doubt Writes (obj-00004) & Baseline Audits
 
 - **Baseline Artifacts:** In initial baseline tests, surviving objects on Region B were observed to exceed client-acknowledged writes by 3 objects (`curl-test.txt`, `partition-test-obj.txt`, `proxy-test.txt`) due to leftover test artifacts from initial smoke tests. Complete bucket resets were added between trials to guarantee clean baseline states.
-- **Empirical Ambiguous Writes:** In our direct sync replication trials bypassing Nginx with a 60-second client timeout, write `obj-00004.txt` timed out at the client after 65.9 seconds. Upon inspecting Region A after restart, `obj-00004.txt` was found persisted on Region A's disk, despite the client observing a timeout failure. This confirms that MinIO commits the object to local storage before or during the remote replication call, creating an in-doubt / ambiguous write state when the remote peer is unreachable.
+- **Observed In-Doubt Write (`obj-00004.txt`):** In our direct sync replication trials bypassing Nginx with a 60-second client timeout, write `obj-00004.txt` timed out at the client after 65.9 seconds. Upon inspecting Region A after restart, `obj-00004.txt` was found persisted on Region A's disk, despite the client observing a timeout failure. This confirms an **observed in-doubt write** state: MinIO committed the object to local storage before or during the remote replication call while the remote peer was unreachable.
 
 ### 3.3 Replication Tradeoff Analysis (Baseline Network)
 
@@ -139,22 +139,24 @@ To observe MinIO's native synchronous replication behavior without proxy timeout
 
 **YES.** MinIO synchronous replication does **not** indefinitely enforce synchronous replica confirmation under sustained network partitions:
 
-1. **Initial Partition Write (Peer Timeout ~65.9s):**
-   When the remote peer becomes unreachable, the first write (`obj-00004.txt`) blocks while MinIO attempts replication across the severed network. MinIO's internal replication connection timeout is ~65 seconds. Clients with standard timeouts (or a 60s timeout) observe a connection timeout.
-2. **Ambiguous Local Persistence:**
+1. **Observed Hang-Then-Fast-Ack Behavior:**
+   When the remote peer was partitioned, the first write (`obj-00004.txt`) hung for ~65.9 seconds before the client timed out. Immediately following this timeout, the next write (`obj-00005.txt`) returned HTTP 200 in 4.2ms to 7.5ms.
+2. **Replication Health-Check Mechanism (Likely Explanation, Not Proven):**
+   MinIO's internal replication health-check marking the remote peer as degraded/offline after the connection timeout is the **likely explanation (unproven)** for why MinIO ceased blocking on the remote peer and silently fell back to local-only acknowledgement.
+3. **Why the Hang Was ~66s with a 60s Client Timeout:**
+   Python's `urllib.request` socket timeout (60.0s) applies per individual socket read operation, rather than as an end-to-end request deadline. Connecting to the local MinIO endpoint took ~0.5ms, followed by transmitting the HTTP PUT request body. The socket then waited on `sock.recv()` for the 60.0s read timeout while MinIO blocked internally attempting replication. Combined with TCP keep-alive, TCP buffer draining, and runtime exception propagation, the total elapsed wall-clock time measured before catching the timeout was ~65.9s.
+4. **Observed In-Doubt Write (`obj-00004.txt`):**
    Even though the client observed a timeout failure, MinIO committed `obj-00004.txt` locally to disk on Region A with `Replication Status: COMPLETED` on A.
-3. **Silent Degradation to Local-Only Acknowledgement:**
-   Once MinIO's replication health check marks the remote peer link as offline/degraded, **MinIO does not fail or reject subsequent writes**. Instead, MinIO **silently degrades to local-only asynchronous acknowledgement**. Write `obj-00005.txt` returned HTTP 200 in 4.2ms to 7.5ms, despite the peer being partitioned.
-4. **Data Loss on Failover (RPO > 0):**
-   Because `obj-00005.txt` returned HTTP 200 to the client but existed only on Region A, when Region A crashed and traffic failed over to Region B, `obj-00005.txt` was missing on Region B. This resulted in **1 acknowledged write lost (RPO = 1)**.
+5. **Data Missing on Region B at Failover (RPO > 0):**
+   Because `obj-00005.txt` returned HTTP 200 to the client but existed only on Region A, when Region A crashed and traffic failed over to Region B, `obj-00005.txt` was missing on Region B. This write was missing from region B at failover; recoverable only if region A's disk survives (RPO = 1).
 
 ### 4.4 Exact Conditions for Synchronous Zero Data Loss Guarantees
 
 - **When Synchronous Mode Guarantees Zero Data Loss (RPO = 0):**
   Synchronous mode guarantees zero data loss **only while the remote replication peer is healthy and reachable**. During normal operation, HTTP 200 is returned only after both nodes acknowledge receipt.
 - **When Synchronous Mode Does NOT Guarantee Zero Loss:**
-  - **Degraded Replication Link:** Once the peer is partitioned for longer than MinIO's internal connection timeout (~65s), MinIO marks the peer offline and silently returns HTTP 200 for local writes without waiting for the replica. If the primary crashes before the link heals and queues are resynced, those acknowledged writes are lost on failover.
-  - **In-Doubt / Ambiguous Writes:** Writes that time out at the client during the ~65s timeout window may still be committed locally to the primary node. If the primary crashes, the client believes the write failed, but the data is stranded on the dead primary.
+  - **Degraded Replication Link:** Once the peer is partitioned for longer than MinIO's internal connection timeout (~65s), MinIO marks the peer offline and silently returns HTTP 200 for local writes without waiting for the replica. If the primary crashes before the link heals and queues are resynced, those acknowledged writes are missing from region B at failover; recoverable only if region A's disk survives.
+  - **Observed In-Doubt Writes:** Writes that time out at the client during the ~65s timeout window may still be committed locally to the primary node. If the primary crashes, the client believes the write failed, but the data remains on the primary's disk.
   - **Failover Demotion:** Automated failover strips the surviving node's replication rule to prevent traffic stalls; during a false-positive failover, nodes accept independent writes and diverge until manual reconciliation.
 
 ---
@@ -175,3 +177,13 @@ Failback is intentionally manual (`scripts/chaos/failback.sh`) to prevent flappi
    - Region B Total Objects: 71
    - Synchronized Objects: 71
    - Out-of-Sync Discrepancy: 0 objects (**100% Eventual Consistency Achieved**).
+
+---
+
+## 6. Known Limitations
+
+1. **Sync Replication Degrades After Peer Timeout:** If a network partition exceeds MinIO's internal replication timeout (~65s), MinIO marks the peer offline and silently falls back to local-only acknowledgement. If the primary crashes before the partition heals, acknowledged writes are missing from Region B at failover; recoverable only if Region A's disk survives.
+2. **False-Positive Failover Divergence:** On automated failover, the controller strips Region B's replication rule so writes succeed unblocked. If a false-positive failover occurs while Region A is still active, both regions accept writes independently and diverge until manual failback.
+3. **Container User Permissions (Root Containers):** Containers run as `user: "0:0"` (root) as an intentional development workaround to prevent host bind-mount permission conflicts across Linux/WSL environments.
+4. **Docker Socket Access:** The failover controller container mounts `/var/run/docker.sock` to issue SIGHUP reloads directly via the Docker Engine API.
+5. **Single-Machine Simulation:** Both fault domains, the WAN bridge network, the edge proxy, and the controller run on a single host machine across Docker bridge networks.
