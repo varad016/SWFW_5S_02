@@ -138,38 +138,7 @@ echo "   Bidirectional replication queues drained and resync verified."
 
 # 6. Repointing Global Proxy back to minio-a
 echo "6. Repointing Global Proxy upstream to minio-a:9000..."
-docker exec -i global-proxy /bin/sh -c 'cat > /etc/nginx/conf.d/nginx.conf' << 'EOF'
-server {
-    listen 8000;
-    server_name _;
-
-    resolver 127.0.0.11 valid=2s ipv6=off;
-    set $backend_upstream http://minio-a:9000;
-
-    client_max_body_size 0;
-    proxy_buffering off;
-    proxy_request_buffering off;
-
-    location / {
-        proxy_pass $backend_upstream;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_connect_timeout 1s;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 30s;
-    }
-}
-EOF
-
-if [ -d config/global ]; then
-  rm -f config/global/nginx.conf 2>/dev/null || true
-  docker exec global-proxy cat /etc/nginx/conf.d/nginx.conf > config/global/nginx.conf 2>/dev/null || true
-fi
-
-docker exec global-proxy nginx -s reload >/dev/null 2>&1
+docker exec global-proxy /bin/sh -c 'sed "s/\${BACKEND_HOST}/minio-a/g; s/\${BACKEND_PORT}/9000/g" /etc/nginx/conf.d/nginx.conf.template > /etc/nginx/conf.d/nginx.conf && nginx -s reload' >/dev/null 2>&1 || true
 
 # 7. Reset failover controller to primary state
 echo "7. Resetting Failover Controller..."
