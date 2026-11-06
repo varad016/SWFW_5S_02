@@ -10,7 +10,7 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 
 | Metric / Scenario | Measured Value (Median & Range) | Test Conditions | Observed Behavior / Guarantees |
 | :--- | :--- | :--- | :--- |
-| **Failover RTO** | **Median: 4.87 s** (Range: 4.86s - 4.91s)<br>Detection: 3.50s (range: 3.503s - 3.505s)<br>Switchover: 0.37s (range: 0.361s - 0.380s) | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s (5 trials) | Automated switchover to Region B; switchover is ~0.37s on clean replica demotion (~0.01s if already standalone) |
+| **Failover RTO** | **Overall Range: 3.31 s - 4.91 s** (8 runs recorded)<br>Mode 1 (3.0s det, instant refusal): 3 runs (3.31s - 3.49s)<br>Mode 2 (3.5s det, timeout): 5 runs (median: 4.87s, range: 4.86s - 4.91s) | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s | Automated switchover to Region B; switchover is ~0.37s on clean replica demotion (~0.01s if already standalone) |
 | **Async RPO (Lag Test)** | **14 objects missing from B at failover** | Active WAN partition on `minio-b` (3.5s duration), 0.3s write burst cadence (3 trials) | Under active WAN partition + primary crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
 | **Sync RPO (Direct Test)** | **1 object lost** | Direct PUT to primary with 60s timeout, mid-stream WAN partition on `minio-b` (66s duration), then kill primary (3 trials) | Initial partition write hangs ~66s; peer marked offline; subsequent write returns HTTP 200 locally (~4ms), missing from Region B at failover |
 | **Failback Behavior** | **Eventual Consistency** (0 discrepancy) | Post-disaster recovery, bidirectional resync `A -> B` and `B -> A` | Manual by design; bidirectional resync recovers stranded partition and failover writes (100% convergence) |
@@ -95,6 +95,10 @@ flowchart TD
 > **5. Single-Machine Simulation:**
 > Both fault domains (`region-a` and `region-b`), the simulated WAN bridge network (`net-wan`), the edge reverse proxy, and the failover controller run on a single physical host machine inside Docker bridge networks.
 
+> [!NOTE]
+> **6. Startup Provisioning & Client Writer Timing:**
+> Concurrent execution of `minio-provision` during stack startup locking bucket replication metadata is the likely cause (one clean run, 3 writes) for any initial write delay. Calling `docker wait minio-provision` before launching client traffic ensures steady write cadence (~1.01s intervals).
+
 > [!IMPORTANT]
 > **Manual Failback by Design:**
 > While failover from Region A to Region B is completely automated upon detecting consecutive healthcheck probe failures, **failback to Region A is intentionally manual**. This prevents cluster flapping, split-brain scenarios, and accidental traffic restoration before cross-region replication queues have completely caught up. Failback is executed safely via `scripts/chaos/failback.sh`.
@@ -168,6 +172,30 @@ docker logs failover-controller | grep -E "FAILOVER|Detection|Switchover|RTO"
 
 # 10. Test GitOps drift self-healing (tamper README.md and verify automatic rollback)
 echo "# unauthorized drift" >> README.md && ./scripts/gitops/reconciler.sh --once
+```
+
+### Optional: Replication Lag & Data Loss Scenario (Non-Zero RPO)
+
+To demonstrate non-zero RPO under network degradation (in-flight replication lag + crash):
+```bash
+# 1. Sever WAN replication link to Region B while primary Region A is running
+./scripts/chaos/partition-wan.sh minio-b
+
+# 2. Start writer stream and let it run for ~4 seconds (WRITER_INTERVAL=0.3 recommended for visible backlog)
+WRITER_INTERVAL=0.3 ./scripts/demo/writer.sh &
+sleep 4
+
+# 3. Crash Region A mid-stream while replication backlog exists on Region A
+./scripts/chaos/kill-region.sh region-a
+
+# 4. Reconnect Region B WAN network to allow proxy traffic
+./scripts/chaos/heal-wan.sh minio-b
+
+# 5. Wait for failover switchover to complete (~5s), stop writer, and check pre-restart RPO
+sleep 5 && (pkill -f writer.sh || true) && ./scripts/demo/rpo-check.sh
+
+# 6. Execute manual failback to restore Region A, resync stranded writes, and audit consistency
+./scripts/chaos/failback.sh && ./scripts/demo/verify.sh
 ```
 
 ---

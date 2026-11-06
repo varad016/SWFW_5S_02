@@ -55,23 +55,44 @@ Theoretical Detection from First Failure:
 - First Success via Proxy: `1793872114.0450`
 
 **Measured Timings:**
-- Detection Latency from First Fail: **3.0040 seconds** (matches theoretical 3.00s model).
+- Detection Latency from First Fail: **3.0040 seconds** (Mode 1: instant ConnectionRefusedError).
 - Detection Latency from Crash: **3.1141 seconds**.
 - Switchover Time: **0.3721 seconds** (re-write Nginx upstream + Docker socket SIGHUP).
-- Total RTO: **3.4862 seconds** (Note: this was a single lucky run where probe 1 got instant ConnectionRefusedError; headline benchmark RTO is median 4.87s).
+- Total RTO: **3.4862 seconds**.
 
-### 2.4 Multi-Trial Clean-State RTO Benchmark (5 Consecutive Trials)
+### 2.4 Multi-Trial Clean-State RTO Benchmark & Detection Modes
 
-To rigorously validate RTO consistency, 5 consecutive trials of the hard crash failover flow (`kill-region.sh region-a`) were executed from a clean primary state (with bidirectional replication active):
+Across all 8 failure injection runs recorded so far (Phase 2 baseline, 5 clean benchmark trials, and 2 live rehearsals), failure detection operates in two distinct, deterministic modes depending on socket behavior on the initial probe:
 
-| Trial # | Detection from First Fail (s) | Detection from Crash (s) | Switchover Duration (s) | Total RTO (s) |
-|---|---|---|---|---|
-| **Trial 1** | 3.5046 | 4.5348 | 0.3711 | 4.9059 |
-| **Trial 2** | 3.5036 | 4.4913 | 0.3657 | 4.8570 |
-| **Trial 3** | 3.5041 | 4.5156 | 0.3714 | 4.8871 |
-| **Trial 4** | 3.5041 | 4.4932 | 0.3798 | 4.8730 |
-| **Trial 5** | 3.5036 | 4.5048 | 0.3608 | 4.8655 |
-| **Summary** | **Median: 3.5041 s** (Range: 3.5036s - 3.5046s) | **Median: 4.5048 s** (Range: 4.4913s - 4.5348s) | **Median: 0.3711 s** (Range: 0.3608s - 0.3798s) | **Median: 4.8730 s** (Range: 4.8570s - 4.9059s) |
+1. **Mode 1 (3.0s Detection - Instant Connection Refused):**
+   - **Mechanism:** Probe 1 hits the killed container's port immediately after the OS closes the socket, resulting in an instant `ConnectionRefusedError` (0.24ms) without waiting for probe timeout. Probes 2 and 3 then hit their 0.5s timeout spaced by 1.0s intervals: `0.0s + 1.0s + 0.5s + 1.0s + 0.5s = 3.00 seconds`.
+   - **Observed Frequency:** **3 runs** (Phase 2 baseline run, Rehearsal 1, Rehearsal 2).
+   - **Detection Latency:** ~3.00s from first fail (3.11s - 3.30s from crash).
+   - **Total RTO:** **3.31s - 3.49s** (switchover 0.01s - 0.37s).
+
+2. **Mode 2 (3.5s Detection - Initial Probe Timeout):**
+   - **Mechanism:** Probe 1 was already in-flight or the socket silently drops SYN packets during teardown, causing all 3 probes to wait the full 0.5s timeout: `3 * 0.5s + 2 * 1.0s = 3.50 seconds`.
+   - **Observed Frequency:** **5 runs** (the 5 clean-state benchmark trials).
+   - **Detection Latency:** ~3.50s from first fail (4.49s - 4.53s from crash).
+   - **Total RTO:** **4.86s - 4.91s** (switchover 0.36s - 0.38s).
+
+**Overall RTO Summary Across ALL 8 Runs:**
+- **Total RTO Range:** **3.31 s – 4.91 s** (Mode 1 count: 3; Mode 2 count: 5).
+- **Detection from First Fail Range:** **3.004 s – 3.505 s**.
+- **Switchover Time Range:** **0.011 s – 0.380 s** (~0.37s when demoting active replica via `mc replicate rm`; ~0.01s if already demoted).
+
+#### 5-Trial Clean-State Benchmark Table (Mode 2 Runs)
+
+To evaluate worst-case timeout behavior under repeatable conditions, 5 consecutive trials were recorded with active bidirectional replication:
+
+| Trial # | Mode | Detection from First Fail (s) | Detection from Crash (s) | Switchover Duration (s) | Total RTO (s) |
+|---|---|---|---|---|---|
+| **Trial 1** | Mode 2 | 3.5046 | 4.5348 | 0.3711 | 4.9059 |
+| **Trial 2** | Mode 2 | 3.5036 | 4.4913 | 0.3657 | 4.8570 |
+| **Trial 3** | Mode 2 | 3.5041 | 4.5156 | 0.3714 | 4.8871 |
+| **Trial 4** | Mode 2 | 3.5041 | 4.4932 | 0.3798 | 4.8730 |
+| **Trial 5** | Mode 2 | 3.5036 | 4.5048 | 0.3608 | 4.8655 |
+| **Summary** | **Mode 2 (5 trials)** | **Median: 3.5041 s** (Range: 3.5036s - 3.5046s) | **Median: 4.5048 s** (Range: 4.4913s - 4.5348s) | **Median: 0.3711 s** (Range: 0.3608s - 0.3798s) | **Median: 4.8730 s** (Range: 4.8570s - 4.9059s) |
 
 **Switchover Duration Analysis (~0.37s vs. ~0.011s):**
 - In a **clean primary state** where Region B has an active cross-region replication rule, the failover controller executes `mc replicate rm local/data-bucket --all --force` via the Docker Engine API to demote Region B to standalone mode. The time spent by `mc` initializing, authenticating, and persisting updated bucket replication metadata on disk (~0.36s to 0.38s) is considered the **likely cause (not proven)** for the ~0.37s switchover.
@@ -81,7 +102,7 @@ To rigorously validate RTO consistency, 5 consecutive trials of the hard crash f
 
 - In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark suites, the interval is overridden to fast-burst rates (`WRITER_INTERVAL=0.15` to `0.30s`).
 - **Startup Stall Between Writes #2 and #3 (Reproduced and Investigated):**
-  In both initial testing and the live rehearsal (`09:52:15` to `09:52:19`), a ~3.97-second gap was observed between writes #2 and #3. Nginx access logs and curl `-w` timing confirmed curl execution latency remained fast (8.0ms). Concurrent execution of the GitOps reconciler / `minio-provision` container initializing cross-region replication configuration and locking bucket replication metadata during stack startup is considered the **likely cause**. Note that the very first occurrence of this stall in earlier smoke testing occurred immediately following a bulk delete operation and may differ. When writer tests are executed after provisioning completes, all writes proceed steadily at ~1.01s intervals with zero stalls.
+  In both initial testing and the live rehearsal (`09:52:15` to `09:52:19`), a ~3.97-second gap was observed between writes #2 and #3. Nginx access logs and curl `-w` timing confirmed curl execution latency remained fast (8.0ms). Concurrent execution of the GitOps reconciler / `minio-provision` container initializing cross-region replication configuration and locking bucket replication metadata during stack startup is considered the **likely cause (one clean run, 3 writes)**. Note that the very first occurrence of this stall in earlier smoke testing occurred immediately following a bulk delete operation and may differ. When writer tests are executed after provisioning completes (`docker wait minio-provision`), all writes proceed steadily at ~1.01s intervals with zero stalls.
 
 ---
 
