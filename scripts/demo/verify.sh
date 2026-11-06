@@ -32,6 +32,14 @@ if ! docker ps --format '{{.Names}}' | grep -q "^minio-b$"; then
   exit 1
 fi
 
+if [ -f .env ]; then
+  eval "$(grep -E '^(MINIO_ROOT_USER|MINIO_ROOT_PASSWORD)=' .env 2>/dev/null || true)"
+fi
+M_USER="${MINIO_ROOT_USER:-deploy_admin}"
+M_PASS="${MINIO_ROOT_PASSWORD:-ha_deploy_admin_pass_987}"
+docker exec minio-a mc alias set local http://localhost:9000 "${M_USER}" "${M_PASS}" >/dev/null 2>&1 || true
+docker exec minio-b mc alias set local http://localhost:9000 "${M_USER}" "${M_PASS}" >/dev/null 2>&1 || true
+
 echo "1. Querying object inventory from Region A..."
 docker exec minio-a mc ls "local/${BUCKET}" 2>/dev/null | awk '{print $NF}' | sort > "${TMP_DIR}/objects_a.txt"
 count_a=$(wc -l < "${TMP_DIR}/objects_a.txt")

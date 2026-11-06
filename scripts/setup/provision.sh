@@ -52,6 +52,8 @@ mc mb --ignore-existing minio-a/"${BUCKET_NAME}" 2>/dev/null || true
 mc mb --ignore-existing minio-b/"${BUCKET_NAME}" 2>/dev/null || true
 mc version enable minio-a/"${BUCKET_NAME}" 2>/dev/null || true
 mc version enable minio-b/"${BUCKET_NAME}" 2>/dev/null || true
+mc anonymous set public minio-a/"${BUCKET_NAME}" 2>/dev/null || true
+mc anonymous set public minio-b/"${BUCKET_NAME}" 2>/dev/null || true
 
 echo "Configuring cross-region bucket replication rules..."
 rules_a=$(mc replicate ls minio-a/"${BUCKET_NAME}" 2>/dev/null || true)

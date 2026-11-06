@@ -35,8 +35,15 @@ docker network connect net-wan minio-b 2>/dev/null || true
 
 # Wait for Region A to be healthy
 echo "   Waiting for Region A to become healthy..."
+if [ -f .env ]; then
+  eval "$(grep -E '^(MINIO_ROOT_USER|MINIO_ROOT_PASSWORD|REPL_USER|REPL_PASSWORD|SYNC_REPLICATION)=' .env 2>/dev/null || true)"
+fi
+M_USER="${MINIO_ROOT_USER:-deploy_admin}"
+M_PASS="${MINIO_ROOT_PASSWORD:-ha_deploy_admin_pass_987}"
+
 attempts=0
-until docker exec minio-a mc admin info local >/dev/null 2>&1; do
+until docker exec minio-a mc alias set local http://localhost:9000 "${M_USER}" "${M_PASS}" >/dev/null 2>&1 && \
+      docker exec minio-a mc admin info local >/dev/null 2>&1; do
   attempts=$((attempts + 1))
   if [ "${attempts}" -ge 30 ]; then
     echo "[ERROR] Timeout waiting for minio-a to become ready."
@@ -44,24 +51,17 @@ until docker exec minio-a mc admin info local >/dev/null 2>&1; do
   fi
   sleep 1
 done
+docker exec minio-b mc alias set local http://localhost:9000 "${M_USER}" "${M_PASS}" >/dev/null 2>&1 || true
 echo "   minio-a is online and healthy."
 
-# 3. Dynamically discover replication ARN on Region B
-echo "3. Dynamically discovering replication ARN on Region B..."
-ARN_B=$(docker exec minio-b mc replicate ls local/"${BUCKET}" 2>/dev/null | awk '/ARN:/ {print $2; exit}' || true)
-
-if [ -z "${ARN_B}" ]; then
-  # Fallback to JSON parsing
-  ARN_B=$(docker exec minio-b mc replicate ls --json local/"${BUCKET}" 2>/dev/null | grep -o '"Bucket":"arn:minio:replication:[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
-fi
+# 3. Dynamically discover replication ARNs on both regions
+echo "3. Dynamically discovering replication ARNs on both regions..."
+ARN_B=$(docker exec minio-b mc replicate ls --json local/"${BUCKET}" 2>/dev/null | grep -o '"Bucket":"arn:minio:replication:[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
 
 if [ -z "${ARN_B}" ]; then
   echo "   Replication rule missing on minio-b (demoted during failover). Restoring replication rule..."
-  if [ -f .env ]; then
-    eval "$(grep -E '^(REPL_USER|REPL_PASSWORD|SYNC_REPLICATION)=' .env 2>/dev/null || true)"
-  fi
-  R_USER="${REPL_USER:-repl_service}"
-  R_PASS="${REPL_PASSWORD:-ha_local_repl_pass_654}"
+  R_USER="${REPL_USER:-deploy_repl}"
+  R_PASS="${REPL_PASSWORD:-ha_deploy_repl_pass_654}"
   SYNC_ARG=""
   if [ "${SYNC_REPLICATION:-false}" = "true" ]; then
     SYNC_ARG="--sync"
@@ -79,42 +79,66 @@ if [ -z "${ARN_B}" ]; then
 fi
 echo "   Discovered ARN (B -> A): ${ARN_B}"
 
-# 4. Wait for replication link to come online and trigger resync
-echo "4. Triggering resync from Region B to Region A to backfill failover writes..."
+ARN_A=$(docker exec minio-a mc replicate ls --json local/"${BUCKET}" 2>/dev/null | grep -o '"Bucket":"arn:minio:replication:[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+if [ -z "${ARN_A}" ]; then
+  echo "[ERROR] Could not discover replication ARN on minio-a."
+  exit 1
+fi
+echo "   Discovered ARN (A -> B): ${ARN_A}"
+
+# 4. Trigger bidirectional resync (both A -> B and B -> A)
+echo "4. Triggering bidirectional resync (A -> B and B -> A)..."
 link_ok=false
 for i in $(seq 1 15); do
-  if docker exec minio-b mc replicate status local/"${BUCKET}" 2>/dev/null | grep -q "Link:.*online"; then
+  if docker exec minio-b mc replicate status local/"${BUCKET}" 2>/dev/null | grep -q "Link:.*online" && \
+     docker exec minio-a mc replicate status local/"${BUCKET}" 2>/dev/null | grep -q "Link:.*online"; then
     link_ok=true
     break
   fi
   sleep 1
 done
 
-docker exec minio-b mc replicate resync start local/"${BUCKET}" --remote-bucket "${ARN_B}" >/dev/null 2>&1 || true
+echo "   Starting resync A -> B (backfilling stranded partition writes to B)..."
+resync_out_a=$(docker exec minio-a mc replicate resync start local/"${BUCKET}" --remote-bucket "${ARN_A}" 2>&1 || true)
+echo "   ${resync_out_a}"
 
-# 5. Monitor replication queue drain and resync completion
-echo "5. Monitoring replication queue drain and resync..."
+echo "   Starting resync B -> A (backfilling failover writes to A)..."
+resync_out_b=$(docker exec minio-b mc replicate resync start local/"${BUCKET}" --remote-bucket "${ARN_B}" 2>&1 || true)
+echo "   ${resync_out_b}"
+
+# 5. Monitor replication queue drain and resync completion on both regions
+echo "5. Monitoring replication queue drain and resync completion on both regions..."
 resync_done=false
 t_start=$(date +%s)
 while [ $(( $(date +%s) - t_start )) -lt 30 ]; do
-  r_status=$(docker exec minio-b mc replicate resync status local/"${BUCKET}" 2>/dev/null || true)
-  if echo "${r_status}" | grep -q "Status: Completed"; then
-    failed_cnt=$(echo "${r_status}" | awk '/Failed/ {print $NF}')
-    if [ "${failed_cnt}" = "0" ] || [ -z "${failed_cnt}" ]; then
-      resync_done=true
-      break
-    else
-      # If some failed before link was fully ready, re-trigger
-      docker exec minio-b mc replicate resync start local/"${BUCKET}" --remote-bucket "${ARN_B}" >/dev/null 2>&1 || true
-    fi
+  r_status_a=$(docker exec minio-a mc replicate resync status local/"${BUCKET}" 2>/dev/null || true)
+  r_status_b=$(docker exec minio-b mc replicate resync status local/"${BUCKET}" 2>/dev/null || true)
+  
+  done_a=false
+  done_b=false
+  if echo "${r_status_a}" | grep -q "Status: Completed"; then
+    done_a=true
+  fi
+  if echo "${r_status_b}" | grep -q "Status: Completed"; then
+    done_b=true
+  fi
+
+  if [ "${done_a}" = true ] && [ "${done_b}" = true ]; then
+    resync_done=true
+    break
   fi
   sleep 0.5
 done
-echo "   Replication queue drained and resync verified."
 
-# 6. Repoint Global Proxy back to minio-a
+echo "   Resync Status A -> B:"
+docker exec minio-a mc replicate resync status local/"${BUCKET}" || true
+echo "   Resync Status B -> A:"
+docker exec minio-b mc replicate resync status local/"${BUCKET}" || true
+echo "   Bidirectional replication queues drained and resync verified."
+
+# 6. Repointing Global Proxy back to minio-a
 echo "6. Repointing Global Proxy upstream to minio-a:9000..."
-cat << 'EOF' > config/global/nginx.conf
+docker exec -i global-proxy /bin/sh -c 'cat > /etc/nginx/conf.d/nginx.conf' << 'EOF'
 server {
     listen 8000;
     server_name _;
@@ -139,6 +163,10 @@ server {
     }
 }
 EOF
+
+if [ -d config/global ]; then
+  docker exec global-proxy cat /etc/nginx/conf.d/nginx.conf > config/global/nginx.conf 2>/dev/null || true
+fi
 
 docker exec global-proxy nginx -s reload >/dev/null 2>&1
 

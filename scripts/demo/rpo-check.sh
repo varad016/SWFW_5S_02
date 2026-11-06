@@ -34,6 +34,14 @@ if ! docker ps --format '{{.Names}}' | grep -q "^minio-b$"; then
   exit 1
 fi
 
+# Ensure local alias is set on minio-b
+if [ -f .env ]; then
+  eval "$(grep -E '^(MINIO_ROOT_USER|MINIO_ROOT_PASSWORD)=' .env 2>/dev/null || true)"
+fi
+M_USER="${MINIO_ROOT_USER:-deploy_admin}"
+M_PASS="${MINIO_ROOT_PASSWORD:-ha_deploy_admin_pass_987}"
+docker exec minio-b mc alias set local http://localhost:9000 "${M_USER}" "${M_PASS}" >/dev/null 2>&1 || true
+
 # 1. Extract all objects that returned HTTP 200 from writer.log
 awk -F, '$4 == "200" {print "obj-" $3 ".txt"}' "${LOG_FILE}" | sort -u > "${TMP_DIR}/acknowledged_200.txt"
 ack_count=$(wc -l < "${TMP_DIR}/acknowledged_200.txt")
