@@ -8,12 +8,12 @@ The platform simulates two independent fault domains (`region-a` and `region-b`)
 
 ## Results & SLA Summary
 
-| Metric / Scenario | Measured Value | Observed Behavior / Guarantees |
-| :--- | :--- | :--- |
-| **Failover RTO** | **3.49 s** | N=3 probes, I=1.0s, 0.5s timeout; 3.11s detection + 0.37s Nginx switchover |
-| **Async RPO (Lag Test)** | **14 objects lost** | Under active WAN partition + crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
-| **Sync RPO (Direct Test)** | **1 object lost** | Initial partition write hangs ~66s; peer marked offline; subsequent write returns HTTP 200 locally, missing from Region B at failover |
-| **Failback Behavior** | **Eventual Consistency** | Manual by design; bidirectional resync (`A -> B` and `B -> A`) recovers stranded writes (0 discrepancy) |
+| Metric / Scenario | Measured Value (Median & Range) | Test Conditions | Observed Behavior / Guarantees |
+| :--- | :--- | :--- | :--- |
+| **Failover RTO** | **Median: 4.87 s** (Range: 4.86s - 4.91s)<br>Detection: 3.50s (range: 3.503s - 3.505s)<br>Switchover: 0.37s (range: 0.361s - 0.380s) | Hard crash (`docker kill minio-a`), N=3 probes, interval=1.0s, timeout=0.5s (5 trials) | Automated switchover to Region B; switchover is ~0.37s on clean replica demotion (~0.01s if already standalone) |
+| **Async RPO (Lag Test)** | **14 objects lost** | Active WAN partition on `minio-b` (3.5s duration), 0.3s write burst cadence (3 trials) | Under active WAN partition + primary crash, in-flight backlog is missing from Region B at failover; recoverable only if Region A's disk survives |
+| **Sync RPO (Direct Test)** | **1 object lost** | Direct PUT to primary with 60s timeout, mid-stream WAN partition on `minio-b` (66s duration), then kill primary (3 trials) | Initial partition write hangs ~66s; peer marked offline; subsequent write returns HTTP 200 locally (~4ms), missing from Region B at failover |
+| **Failback Behavior** | **Eventual Consistency** (0 discrepancy) | Post-disaster recovery, bidirectional resync `A -> B` and `B -> A` (5 trials) | Manual by design; bidirectional resync recovers stranded partition and failover writes (100% convergence) |
 
 ---
 
@@ -72,7 +72,7 @@ flowchart TD
 > [!NOTE]
 > **1. Synchronous Replication Degrades After Peer Timeout:**
 > Under synchronous replication (`--sync enable`), PUT requests block until acknowledged by both nodes while the WAN link is healthy (~6ms to 9ms latency), guaranteeing zero data loss (RPO = 0).
-> - **Can sync ever ack a write the peer doesn't have? YES:** Under a network partition, the first write hangs for MinIO's internal replication connection timeout (~66s). If the client times out, the object is committed locally on Region A as an **observed in-doubt write** (`obj-00004.txt`). Once the ~66s timeout trips, MinIO flags the peer as degraded/offline (likely explanation) and **silently degrades to local-only asynchronous acknowledgement** for subsequent writes, returning HTTP 200 (~4ms) even though the peer has not received the data. If Region A crashes before the link heals and queues resync, those client-acknowledged writes are missing from Region B at failover; recoverable only if Region A's disk survives (measured RPO = 1 object).
+> - **Can sync ever ack a write the peer doesn't have? YES:** Under a network partition, the first write hangs (client returned at ~66s despite 60s timeout; cause undetermined). If the client times out, the object is committed locally on Region A as an **observed in-doubt write** (`obj-00004.txt`). Once the ~66s timeout trips, MinIO flags the peer as degraded/offline (likely explanation) and **silently degrades to local-only asynchronous acknowledgement** for subsequent writes, returning HTTP 200 (~4ms) even though the peer has not received the data. If Region A crashes before the link heals and queues resync, those client-acknowledged writes are missing from Region B at failover; recoverable only if Region A's disk survives (measured RPO = 1 object).
 > - **Asynchronous Mode (`--sync disable`):** Prioritizes write availability (AP mode) with ~4ms PUT latency. If the primary crashes while replication lag exists, writes remaining in the replication backlog buffer prior to the crash are missing from Region B at failover; recoverable only if Region A's disk survives (measured RPO of 14 objects under lag-injection).
 
 > [!WARNING]
@@ -148,7 +148,7 @@ cd ~/deploy/SWFW_5S_02 && docker compose --profile all up -d
 ./scripts/chaos/kill-region.sh region-a
 
 # 5. Inspect controller logs for measured failover detection and RTO switchover timing
-docker logs failover-controller | grep -E "FAILOVER|Detection|Switchover"
+docker logs failover-controller | grep -E "FAILOVER|Detection|Switchover|RTO"
 
 # 6. Stop writer stream and audit true pre-restart RPO on surviving Region B
 pkill -f writer.sh && ./scripts/demo/rpo-check.sh

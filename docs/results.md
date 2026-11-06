@@ -60,10 +60,28 @@ Theoretical Detection from First Failure:
 - Switchover Time: **0.3721 seconds** (re-write Nginx upstream + Docker socket SIGHUP).
 - Total RTO: **3.4862 seconds**.
 
-### 2.4 Writer Cadence & Startup Timing Note
+### 2.4 Multi-Trial Clean-State RTO Benchmark (5 Consecutive Trials)
 
-- In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark and chaos suites, the interval is overridden to fast-burst rates (e.g. `WRITER_INTERVAL=0.15` to `0.30s`). With curl execution latency (~4ms to 10ms), this yields an observed cadence of ~0.31s to 0.32s per write.
-- A 3.903-second gap observed between writes #2 and #3 in one initial run is unexplained, not reproduced in subsequent runs. Curls for writes #2 and #3 completed in 9.6ms and 9.0ms respectively. Subsequent clean runs confirmed steady ~0.31s intervals across all writes.
+To rigorously validate RTO consistency, 5 consecutive trials of the hard crash failover flow (`kill-region.sh region-a`) were executed from a clean primary state (with bidirectional replication active):
+
+| Trial # | Detection from First Fail (s) | Detection from Crash (s) | Switchover Duration (s) | Total RTO (s) |
+|---|---|---|---|---|
+| **Trial 1** | 3.5046 | 4.5348 | 0.3711 | 4.9059 |
+| **Trial 2** | 3.5036 | 4.4913 | 0.3657 | 4.8570 |
+| **Trial 3** | 3.5041 | 4.5156 | 0.3714 | 4.8871 |
+| **Trial 4** | 3.5041 | 4.4932 | 0.3798 | 4.8730 |
+| **Trial 5** | 3.5036 | 4.5048 | 0.3608 | 4.8655 |
+| **Summary** | **Median: 3.5041 s** (Range: 3.5036s - 3.5046s) | **Median: 4.5048 s** (Range: 4.4913s - 4.5348s) | **Median: 0.3711 s** (Range: 0.3608s - 0.3798s) | **Median: 4.8730 s** (Range: 4.8570s - 4.9059s) |
+
+**Switchover Duration Analysis (~0.37s vs. ~0.011s):**
+- In a **clean primary state** where Region B has an active cross-region replication rule, the failover controller executes `mc replicate rm local/data-bucket --all --force` via the Docker Engine API to demote Region B to standalone mode. Initializing `mc` in `minio-b`, authenticating, connecting to the local MinIO daemon, and persisting updated bucket replication metadata on disk takes **~0.36s to 0.38s**.
+- In runs where Region B was **already standalone** (no active replication rule present on Region B), `mc replicate rm` returned almost immediately without updating metadata, reducing the switchover duration to **~0.011s** (measuring solely Nginx template re-write and SIGHUP reload).
+
+### 2.5 Writer Cadence & Startup Timing Note
+
+- In standalone usage, `scripts/demo/writer.sh` defaults to a 1.0-second interval (`WRITER_INTERVAL=1.0`). In benchmark suites, the interval is overridden to fast-burst rates (`WRITER_INTERVAL=0.15` to `0.30s`).
+- **Startup Stall Between Writes #2 and #3 (Reproduced and Identified):**
+  In both initial testing and the live rehearsal (`09:52:15` to `09:52:19`), a ~3.97-second gap was observed between writes #2 and #3. Nginx access logs and curl `-w` timing confirmed curl execution latency remained fast (8.0ms). However, the loop iteration stall occurred when the writer was started immediately after stack launch while the GitOps reconciler / `minio-provision` container was running concurrently. During this startup window, `minio-provision` connects to `minio-a` and `minio-b` to initialize cross-region replication configuration, acquiring locks on bucket replication metadata. When writer tests are executed after provisioning completes, all writes proceed steadily at ~1.01s intervals with zero stalls.
 
 ---
 
@@ -143,8 +161,8 @@ To observe MinIO's native synchronous replication behavior without proxy timeout
    When the remote peer was partitioned, the first write (`obj-00004.txt`) hung for ~65.9 seconds before the client timed out. Immediately following this timeout, the next write (`obj-00005.txt`) returned HTTP 200 in 4.2ms to 7.5ms.
 2. **Replication Health-Check Mechanism (Likely Explanation, Not Proven):**
    MinIO's internal replication health-check marking the remote peer as degraded/offline after the connection timeout is the **likely explanation (unproven)** for why MinIO ceased blocking on the remote peer and silently fell back to local-only acknowledgement.
-3. **Why the Hang Was ~66s with a 60s Client Timeout:**
-   Python's `urllib.request` socket timeout (60.0s) applies per individual socket read operation, rather than as an end-to-end request deadline. Connecting to the local MinIO endpoint took ~0.5ms, followed by transmitting the HTTP PUT request body. The socket then waited on `sock.recv()` for the 60.0s read timeout while MinIO blocked internally attempting replication. Combined with TCP keep-alive, TCP buffer draining, and runtime exception propagation, the total elapsed wall-clock time measured before catching the timeout was ~65.9s.
+3. **Timeout Behavior Under Partition (Client Returned at ~66s Despite 60s Timeout; Cause Undetermined):**
+   In our direct PUT benchmark with a 60s client socket timeout, the client returned at ~65.9s despite the 60s timeout; cause undetermined. Direct verification using `curl --max-time 60 -w '%{time_total}'` against `minio-a` during an active partition returned at 60.08s with exit code 28 (`CURLE_OPERATION_TIMEDOUT`). In both cases, the client observed a timeout without receiving an HTTP acknowledgement, while MinIO committed the object locally to Region A.
 4. **Observed In-Doubt Write (`obj-00004.txt`):**
    Even though the client observed a timeout failure, MinIO committed `obj-00004.txt` locally to disk on Region A with `Replication Status: COMPLETED` on A.
 5. **Data Missing on Region B at Failover (RPO > 0):**
