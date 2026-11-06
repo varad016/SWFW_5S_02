@@ -50,6 +50,15 @@ net-region-a (172.28.10.0/24)             net-region-b (172.28.20.0/24)
 > **Manual Failback by Design:**
 > While failover from Region A to Region B is completely automated upon detecting consecutive healthcheck probe failures, **failback to Region A is intentionally manual**. This prevents cluster flapping, split-brain scenarios, and accidental traffic restoration before cross-region replication queues have completely caught up. Failback is executed safely via `scripts/chaos/failback.sh`.
 
+> [!WARNING]
+> **Failover Demotion & False-Positive Divergence Risk:**
+> Upon initiating automated failover, the failover controller removes Region B's replication rule (`mc replicate rm local/data-bucket --all --force`) via the Docker socket. This demotes Region B to standalone mode so client writes never hang or block even if synchronous replication was active. Consequently, if a **false-positive failover** occurs (e.g. transient probe packet loss while Region A was actually still running and accepting client writes), both regions will accept independent writes and **diverge** until an operator intervenes and executes `scripts/chaos/failback.sh` to trigger bidirectional resync and merge object histories.
+
+> [!NOTE]
+> **Synchronous vs. Asynchronous Replication Guarantees:**
+> - **Synchronous Mode (`--sync enable`):** Guarantees zero data loss (RPO = 0) for all client-acknowledged writes. Writes to the primary block until the secondary replica acknowledges receipt; if the secondary or WAN link fails, writes fail (HTTP 502 / timeout) rather than returning un-replicated HTTP 200s. **Zero loss is guaranteed strictly for client-acknowledged (HTTP 200) writes.** Under network partitions, write availability drops to 0% (CP mode in CAP theorem).
+> - **Asynchronous Mode (`--sync disable`):** Prioritizes write availability (AP mode) with ~4ms PUT latency. If the primary crashes while replication lag exists, writes remaining in the replication backlog buffer prior to the crash are lost upon failover (measured RPO of 14 objects under lag-injection).
+
 ---
 
 ## Getting Started

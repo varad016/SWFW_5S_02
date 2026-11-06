@@ -121,6 +121,30 @@ To rigorously test RPO limits, a lag-injection test was executed across 3 trials
 1. **Asynchronous Mode (AP):** Maintains 100% write availability during network partitions (~4ms PUT latency). However, if the primary crashes before the partition heals, all writes queued in the replication backlog (`obj-00001.txt` through `obj-00014.txt`) are lost upon failover, producing a measured RPO of 14 objects.
 2. **Synchronous Mode (CP):** Strictly enforces consistency and zero data loss (RPO = 0). When Region B is unreachable across the WAN, writes to `minio-a` hang waiting for the remote replica, eventually timing out and returning HTTP 502/504. Because no writes are acknowledged to the client during the partition, zero acknowledged writes are lost when Region A crashes.
 
+### 4.3 Long-Duration Lag-Injection Test (30-Second Partition in Synchronous Mode)
+
+To verify behavior under extended partitions, 3 trials were executed with `minio-b` partitioned from `net-wan` for a full 30 seconds of active client writes prior to crashing `minio-a`:
+
+| Trial # | Partition Duration | Early Writes (0–10s) Status & Latency | Late Writes (10–30s) Status & Latency | Client Acked (HTTP 200) | Present on Region B | Acked but Missing (RPO) |
+|---|---|---|---|---|---|---|
+| **Trial 1** | 30.0 s | TimeoutError / HTTP 0 (avg: 7939.5 ms) | TimeoutError / HTTP 0 (avg: 5004.9 ms) | **0 objects** | 0 objects | **0 objects lost (RPO = 0)** |
+| **Trial 2** | 30.0 s | HTTP 502 Bad Gateway (avg: 4005.8 ms) | HTTP 502 Bad Gateway (avg: 4598.8 ms) | **0 objects** | 0 objects | **0 objects lost (RPO = 0)** |
+| **Trial 3** | 30.0 s | HTTP 502 Bad Gateway (avg: 4004.6 ms) | HTTP 502 Bad Gateway (avg: 4590.4 ms) | **0 objects** | 0 objects | **0 objects lost (RPO = 0)** |
+
+**Early vs. Late Write Analysis:**
+- **Early Writes (0–10s):** Every request blocks waiting for the replica acknowledgement. Requests terminate at either the client-side timeout (~5.0s to ~7.9s) or Nginx gateway timeout (~4.0s) returning HTTP 502 Bad Gateway. Exactly zero writes succeed.
+- **Late Writes (10–30s):** MinIO continues to strictly enforce synchronous replication without falling back to local-only async writes. Requests continue to block and return HTTP 502 Bad Gateway (~4.0s to ~6.9s).
+- **RPO Audit Result:** Pre-restart audit (`scripts/demo/rpo-check.sh`) confirmed 0 client-acknowledged writes and 0 objects missing on Region B.
+
+### 4.4 Exact Conditions for Synchronous Zero Data Loss Guarantees
+
+- **When Synchronous Mode Guarantees Zero Data Loss (RPO = 0):**
+  Synchronous replication guarantees zero data loss strictly for **client-acknowledged (HTTP 200) writes**. A write will never return HTTP 200 to the client until both the local primary and the secondary replica have confirmed persistent write to disk. If the network or secondary fails, writes fail rather than returning un-replicated success. Therefore, if the primary crashes at any time, all client-acknowledged data is guaranteed to exist on the secondary (RPO = 0).
+- **When Synchronous Mode Does NOT Guarantee Zero Loss / Tradeoffs:**
+  - **Availability Tradeoff (CP):** Under network partitions or secondary node failure, write availability drops to 0%. Clients receive HTTP 502/504 errors or connection timeouts.
+  - **In-Doubt / Ambiguous Writes:** If a primary crashes after the replica was persisted on Region B but before the HTTP 200 response reached the client, the client observes a failed request (HTTP 502) even though the data was saved.
+  - **Demotion on Failover:** Because failover removes the surviving node's replication rule to enable unblocked writes, if a false-positive failover occurs, both regions will operate independently and diverge until manual failback resynchronizes them.
+
 ---
 
 ## 5. Disaster Recovery & Failback Eventual Consistency
@@ -128,10 +152,12 @@ To rigorously test RPO limits, a lag-injection test was executed across 3 trials
 Failback is intentionally manual (`scripts/chaos/failback.sh`) to prevent flapping and split-brain:
 
 1. **Service Recovery:** Starts `minio-a` and reconnects `net-wan`.
-2. **Replication Link Health:** Waits until `mc replicate status` reports link status as `online`.
-3. **Resync Execution:** Triggers `mc replicate resync start` to backfill all failover writes committed to Region B during the outage.
-4. **Drain Verification:** Confirms `queued.count == 0` and `resync status` reports `Status: Completed` with `Failed: 0`.
-5. **Traffic Handover:** Updates Nginx upstream back to `minio-a:9000` and reloads via Docker socket.
+2. **Stranded Writes & Replication Backlog:** When `minio-a` restarts after an abrupt SIGKILL crash during an async partition, stranded objects on Region A do not automatically replicate to Region B on their own. Dropping volatile in-memory replication queues during SIGKILL is considered the **likely cause unless proven otherwise**.
+3. **Bidirectional Resync Execution:** `scripts/chaos/failback.sh` executes resync in **both directions**:
+   - **Direction A -> B:** `docker exec minio-a mc replicate resync start local/data-bucket --remote-bucket <ARN_A>` (backfills stranded partition writes to Region B).
+   - **Direction B -> A:** `docker exec minio-b mc replicate resync start local/data-bucket --remote-bucket <ARN_B>` (backfills failover writes to Region A).
+4. **Drain Verification:** Confirms `queued.count == 0` and `resync status` reports `Status: Completed` with `Failed: 0` on both nodes.
+5. **Traffic Handover:** Updates Nginx upstream back to `minio-a:9000` via Docker Engine API and reloads configuration.
 6. **Eventual Consistency Audit:** `scripts/demo/verify.sh` confirmed:
    - Region A Total Objects: 71
    - Region B Total Objects: 71
